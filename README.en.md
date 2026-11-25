@@ -9,7 +9,7 @@ A context insights plugin for **Google Antigravity**. It puts per-request contex
 - Reads only local data under `~/.gemini/antigravity`; no network, no uploads
 - Derived from [dsh-context](https://github.com/bowenliang123/dsh-context) (Apache-2.0, see [NOTICE](NOTICE))
 
-![Context insights](docs/screenshots/insights.png)
+![Context insights](docs/screenshots/insights.png?v=2)
 
 ## Features
 
@@ -43,10 +43,10 @@ The right-hand aux pane, scoped to the current conversation.
 
 | Context panel | Fleet |
 | --- | --- |
-| ![Context panel](docs/screenshots/context.png) | ![Fleet](docs/screenshots/fleet.png) |
+| ![Context panel](docs/screenshots/context.png?v=2) | ![Fleet](docs/screenshots/fleet.png?v=2) |
 
 <p align="center">
-  <img src="docs/screenshots/aux-pane.png" width="360" alt="480px aux pane">
+  <img src="docs/screenshots/aux-pane.png?v=2" width="360" alt="480px aux pane">
 </p>
 
 ## Install

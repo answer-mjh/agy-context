@@ -9,7 +9,7 @@
 - 数据全部来自本机的 `~/.gemini/antigravity`，不联网、不上传
 - 衍生自 [dsh-context](https://github.com/bowenliang123/dsh-context)（Apache-2.0，见 [NOTICE](NOTICE)）
 
-![上下文洞察](docs/screenshots/insights.png)
+![上下文洞察](docs/screenshots/insights.png?v=2)
 
 ## 目录
 
@@ -57,10 +57,10 @@
 
 | Context 面板 | 编队 |
 | --- | --- |
-| ![Context 面板](docs/screenshots/context.png) | ![编队](docs/screenshots/fleet.png) |
+| ![Context 面板](docs/screenshots/context.png?v=2) | ![编队](docs/screenshots/fleet.png?v=2) |
 
 <p align="center">
-  <img src="docs/screenshots/aux-pane.png" width="360" alt="480px 辅助面板">
+  <img src="docs/screenshots/aux-pane.png?v=2" width="360" alt="480px 辅助面板">
 </p>
 
 ## 安装
