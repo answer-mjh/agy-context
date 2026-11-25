@@ -1,0 +1,13 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "agy-context",
+  "displayName": "Antigravity Context",
+  "version": "0.1.0",
+  "description": "Context insights and lifecycle dashboard for Antigravity: cross-session KPIs, 7-day charts, 8-week heatmap, per-request timeline (Total/Delta/Overview), Context Browser & DNA view, events, file activity, and command executions.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Open Antigravity Context to inspect my current session context composition and timeline",
+    "Show my cross-session context insights, token usage, and top skills/tools",
+    "Inspect file activity and command executions in my active conversation"
+  ]
+}

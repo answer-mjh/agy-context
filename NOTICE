@@ -1,0 +1,13 @@
+Antigravity Context (agy-context)
+Copyright 2026 answer-mjh
+
+This product is a derivative work of dsh-context
+(https://github.com/bowenliang123/dsh-context),
+Copyright 2025 bowenliang123, licensed under the Apache License, Version 2.0.
+
+Modifications: the context-insight feature set and UI information architecture
+were ported from the dsh-context DeepSeek Harness plugin to the Antigravity
+sidecar runtime. The implementation is plain JavaScript / HTML / CSS without a
+build step, with a new data layer for Antigravity transcripts, language-service
+context snapshots, token accounting and agent-family inference. Feature by
+feature differences are documented in docs/parity-with-dsh-context.md.

@@ -1,0 +1,151 @@
+/* ═══ DSH-Inspired Theme System (Light / Dark / High-Contrast) ═══ */
+:root {
+  --font-sans: var(--font-sans-host, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", Roboto, sans-serif);
+  --font-mono: var(--font-mono-host, ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Mono", Menlo, Consolas, monospace);
+
+  /* DSH Category Semantic Palette */
+  --cat-system: #5b5ce6;
+  --cat-tool-def: #f59e0b;
+  --cat-user: #22c55e;
+  --cat-injected: #8b5cf6;
+  --cat-skills: #f97316;
+  --cat-tools: #14b8a6;
+  --cat-thinking: #a855f7;
+  --cat-assistant: #ec4899;
+  --cat-media: #06b6d4;
+  --cat-other: #94a3b8;
+
+  /* DSH Timing Palette */
+  --time-model: #2563eb;
+  --time-thinking: #9333ea;
+  --time-reply: #db2777;
+  --time-tool-arg: #f59e0b;
+  --time-tool: #10b981;
+  --time-overhead: #94a3b8;
+
+  /* Bar Chart Colors */
+  --bar-token: #5b9bf8;
+  --bar-cost: #34d399;
+
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 12px;
+  --radius-pill: 999px;
+}
+
+body[data-theme="light"] {
+  --bg: #f5f6f8;
+  --surface: #ffffff;
+  --surface-well: #f5f6f9;
+  --surface-hover: #eef1f6;
+  --border: #e8eaef;
+  --border-strong: #d5d9e2;
+  --ink: #111827;
+  --ink-secondary: #374151;
+  --ink-muted: #6b7280;
+  --accent: #2563eb;
+  --accent-soft: rgba(37, 99, 235, 0.10);
+  --pill-active-bg: #18181b;
+  --pill-active-ink: #ffffff;
+  --card-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+  --good: #16a34a;
+  --good-soft: rgba(22, 163, 74, 0.10);
+  --warn: #d97706;
+  --warn-soft: rgba(217, 119, 6, 0.12);
+  --danger: #e11d48;
+  --danger-soft: rgba(225, 29, 72, 0.10);
+  --heat-0: #edf0f5;
+  --heat-1: #dbeafe;
+  --heat-2: #93c5fd;
+  --heat-3: #60a5fa;
+  --heat-4: #3b82f6;
+  --reserve-stripe: repeating-linear-gradient(
+    -45deg,
+    rgba(100, 116, 139, 0.22),
+    rgba(100, 116, 139, 0.22) 4px,
+    rgba(100, 116, 139, 0.06) 4px,
+    rgba(100, 116, 139, 0.06) 8px
+  );
+  --output-stripe: repeating-linear-gradient(
+    -45deg,
+    rgba(217, 119, 6, 0.26),
+    rgba(217, 119, 6, 0.26) 4px,
+    rgba(217, 119, 6, 0.07) 4px,
+    rgba(217, 119, 6, 0.07) 8px
+  );
+  color-scheme: light;
+}
+
+body[data-theme="dark"] {
+  --bg: #0f131a;
+  --surface: #161b24;
+  --surface-well: #1d2432;
+  --surface-hover: #252e40;
+  --border: #252f40;
+  --border-strong: #354259;
+  --ink: #f1f5f9;
+  --ink-secondary: #cbd5e1;
+  --ink-muted: #8b98ad;
+  --accent: #60a5fa;
+  --accent-soft: rgba(96, 165, 250, 0.14);
+  --pill-active-bg: #f1f5f9;
+  --pill-active-ink: #0f172a;
+  --card-shadow: 0 1px 3px rgba(0, 0, 0, 0.24);
+  --good: #34d399;
+  --good-soft: rgba(52, 211, 153, 0.14);
+  --warn: #fbbf24;
+  --warn-soft: rgba(251, 191, 36, 0.14);
+  --danger: #fb7185;
+  --danger-soft: rgba(251, 113, 133, 0.15);
+  --heat-0: #1e2533;
+  --heat-1: #1e3a5f;
+  --heat-2: #1d4ed8;
+  --heat-3: #3b82f6;
+  --heat-4: #60a5fa;
+  --reserve-stripe: repeating-linear-gradient(
+    -45deg,
+    rgba(148, 163, 184, 0.22),
+    rgba(148, 163, 184, 0.22) 4px,
+    rgba(148, 163, 184, 0.06) 4px,
+    rgba(148, 163, 184, 0.06) 8px
+  );
+  --output-stripe: repeating-linear-gradient(
+    -45deg,
+    rgba(251, 191, 36, 0.28),
+    rgba(251, 191, 36, 0.28) 4px,
+    rgba(251, 191, 36, 0.08) 4px,
+    rgba(251, 191, 36, 0.08) 8px
+  );
+  color-scheme: dark;
+}
+
+body[data-theme="hc"] {
+  --bg: #000000;
+  --surface: #0b0f17;
+  --surface-well: #111827;
+  --surface-hover: #1f2937;
+  --border: #60a5fa;
+  --border-strong: #ffffff;
+  --ink: #ffffff;
+  --ink-secondary: #e2e8f0;
+  --ink-muted: #cbd5e1;
+  --accent: #7dd3fc;
+  --accent-soft: rgba(125, 211, 252, 0.22);
+  --pill-active-bg: #ffffff;
+  --pill-active-ink: #000000;
+  --card-shadow: none;
+  --good: #4ade80;
+  --good-soft: rgba(74, 222, 128, 0.22);
+  --warn: #fde047;
+  --warn-soft: rgba(253, 224, 71, 0.22);
+  --danger: #fca5a5;
+  --danger-soft: rgba(252, 165, 165, 0.22);
+  --heat-0: #1e293b;
+  --heat-1: #0284c7;
+  --heat-2: #38bdf8;
+  --heat-3: #4ade80;
+  --heat-4: #fde047;
+  --reserve-stripe: repeating-linear-gradient(-45deg, #64748b, #64748b 4px, #000 4px, #000 8px);
+  --output-stripe: repeating-linear-gradient(-45deg, #fde047, #fde047 4px, #000 4px, #000 8px);
+  color-scheme: dark;
+}
