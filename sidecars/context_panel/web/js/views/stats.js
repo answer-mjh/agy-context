@@ -190,10 +190,12 @@
               </button>
             ` : ''}
           </div>
+          ${callbacks?.onGoInsights ? `
           <div style="border-top:1px solid var(--border);padding-top:9px;display:flex;align-items:center;justify-content:space-between;gap:6px">
             <span class="card-subtitle">${isZh ? '全局跨会话汇总' : 'Cross-session summary'}</span>
             <button class="btn btn-sm" id="ctx-go-insights">${escHtml(t('navInsights'))} →</button>
           </div>
+          ` : ''}
         </div>
       </div>
 

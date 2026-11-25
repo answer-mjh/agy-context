@@ -38,6 +38,30 @@ async function run() {
     await insightsRes2.json();
     console.log(`[verify] Insights cached pass OK (${Date.now() - t1}ms)`);
 
+    // 3b. Strict session isolation checks (never fall back to sessions[0])
+    const noIdSess = await (await fetch(`${server.url}/api/session`)).json();
+    assert.equal(noIdSess.empty, true, '/api/session without id must not fall back to sessions[0]');
+    assert.equal(noIdSess.reason, 'missing_conversation_id');
+    assert.equal(noIdSess.session, null);
+
+    const noIdFleet = await (await fetch(`${server.url}/api/fleet`)).json();
+    assert.equal(noIdFleet.empty, true, '/api/fleet without id must not fall back to sessions[0]');
+    assert.equal(noIdFleet.reason, 'missing_conversation_id');
+
+    const noIdStep = await (await fetch(`${server.url}/api/step`)).json();
+    assert.equal(noIdStep.empty, true, '/api/step without id must not fall back to sessions[0]');
+    assert.equal(noIdStep.reason, 'missing_conversation_id');
+
+    const missingIdSess = await (await fetch(`${server.url}/api/session?id=nonexistent-session-id-check`)).json();
+    assert.equal(missingIdSess.empty, true, '/api/session with unknown id must stay empty');
+    assert.equal(missingIdSess.reason, 'no_transcript_yet');
+    assert.equal(missingIdSess.session, null);
+
+    // Insights KPI must equal the sum of matching sessions' billable tokens
+    const insightsSum = insights.sessions.reduce((acc, item) => acc + (item.billableTokens || 0), 0);
+    assert.equal(insights.kpi.billableTokens, insightsSum, 'insights kpi.billableTokens should equal sum of matching sessions');
+    console.log('[verify] Strict isolation & Insights aggregation OK');
+
     // 4. Session overview & step browser endpoints
     if (health.latestSessionId) {
       const sessRes = await fetch(`${server.url}/api/session?id=${encodeURIComponent(health.latestSessionId)}`);
@@ -45,12 +69,23 @@ async function run() {
       const sessPayload = await sessRes.json();
       assert.equal(sessPayload.empty, false);
       assert.ok(sessPayload.session);
+      assert.equal(sessPayload.session.id, health.latestSessionId);
       const s = sessPayload.session;
       console.log(
         `[verify] Session OK: title="${s.meta.title}", model=${s.meta.model}, ` +
         `requests=${s.timeline.steps.length}, turns=${s.timeline.turns.length}, ` +
         `events=${s.events.length}, files=${s.fileActivity.totalFiles}, cmds=${s.commands.summary.total}`
       );
+      if (insights.sessions.length >= 2) {
+        const secondId = insights.sessions.find(item => item.id !== health.latestSessionId)?.id;
+        if (secondId) {
+          const secondPayload = await (await fetch(`${server.url}/api/session?id=${encodeURIComponent(secondId)}`)).json();
+          assert.equal(secondPayload.empty, false);
+          assert.equal(secondPayload.session.id, secondId, 'second session returned wrong conversation id');
+          assert.notEqual(secondPayload.session.id, s.id);
+          console.log(`[verify] Second distinct session OK: id=${secondId.slice(0, 8)}, billable=${secondPayload.session.stats.tokens.billableTotal}`);
+        }
+      }
       const comp = s.currentContext?.composition || {};
       const compKeys = ['systemBase', 'toolDefs', 'tools', 'user', 'injected', 'skills', 'assistant', 'thinking', 'media', 'other'];
       const compSum = compKeys.reduce((acc, key) => acc + (comp[key] || 0), 0);

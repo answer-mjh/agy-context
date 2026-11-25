@@ -55,6 +55,18 @@
     document.body.setAttribute('data-theme', mode);
   }
 
+  let pushedConversationId = '';
+  const conversationListeners = new Set();
+
+  function notifyConversationChange(nextId) {
+    const clean = typeof nextId === 'string' ? nextId.trim() : '';
+    if (!clean || clean === pushedConversationId) return;
+    pushedConversationId = clean;
+    for (const fn of conversationListeners) {
+      try { fn(clean); } catch { /* ignore */ }
+    }
+  }
+
   function initThemeSync() {
     applyTheme();
     window.addEventListener('message', (ev) => {
@@ -73,6 +85,18 @@
           ? data.theme
           : undefined;
         setTimeout(() => applyTheme(explicit), 15);
+      } else if (
+        data.type === 'conversation-change' ||
+        data.type === 'active-conversation' ||
+        data.command === 'conversation-change'
+      ) {
+        const nextId =
+          data.conversationId ||
+          data.cascadeId ||
+          data.payload?.conversationId ||
+          data.payload?.cascadeId ||
+          '';
+        if (nextId) notifyConversationChange(nextId);
       }
     });
 
@@ -84,15 +108,28 @@
 
   function getHostConversationId() {
     const params = new URLSearchParams(window.location.search || '');
-    const urlConversationId = params.get('conversationId') || '';
-    if (urlConversationId) {
-      return urlConversationId;
+    const urlConversationId =
+      params.get('conversationId') ||
+      params.get('conversation_id') ||
+      params.get('cascadeId') ||
+      '';
+    if (urlConversationId && urlConversationId.trim()) {
+      return urlConversationId.trim();
     }
     const sidecarApi = getSidecarApi();
-    if (sidecarApi && typeof sidecarApi.conversationId === 'string' && sidecarApi.conversationId) {
-      return sidecarApi.conversationId;
+    if (sidecarApi && typeof sidecarApi.conversationId === 'string' && sidecarApi.conversationId.trim()) {
+      return sidecarApi.conversationId.trim();
+    }
+    if (pushedConversationId) {
+      return pushedConversationId;
     }
     return '';
+  }
+
+  function onConversationChange(listener) {
+    if (typeof listener !== 'function') return () => {};
+    conversationListeners.add(listener);
+    return () => conversationListeners.delete(listener);
   }
 
   async function apiFetch(url, options) {
@@ -175,6 +212,7 @@
     initThemeSync,
     applyTheme,
     getHostConversationId,
+    onConversationChange,
     apiFetch,
     copyText,
     showTooltip,

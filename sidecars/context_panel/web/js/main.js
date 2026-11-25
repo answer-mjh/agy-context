@@ -2,9 +2,11 @@
   const AGY = (global.AGY_CTX = global.AGY_CTX || {});
 
   const viewMode = document.body.getAttribute('data-view') || 'sidebar';
+  const isAuxPane = viewMode === 'aux';
+  const initialHostId = isAuxPane ? (AGY.bridge.getHostConversationId() || '') : '';
 
   const appState = {
-    page: viewMode === 'aux' ? 'context' : 'insights', // 'insights' | 'context'
+    page: isAuxPane ? 'context' : 'insights', // 'insights' | 'context' | 'fleet'
     prefs: {
       lang: 'zh',
       insightsRange: '30d',
@@ -29,8 +31,9 @@
       hmMetric: 'tokens',
     },
     // Context dashboard state
-    sessionId: AGY.bridge.getHostConversationId() || '',
-    hostSessionId: AGY.bridge.getHostConversationId() || '',
+    sessionId: initialHostId,
+    hostSessionId: initialHostId,
+    emptyReason: '',
     sessionsList: [],
     sessionData: null,
     stepData: null,
@@ -70,6 +73,7 @@
 
   let hoverFetchTimer = null;
   let pollTimer = null;
+  let sessionLoadToken = 0;
 
   function qs(obj) {
     const p = new URLSearchParams();
@@ -86,21 +90,36 @@
     if (!topbar) return;
     const showFleetTab = appState.prefs.fleetTab !== 'hide';
 
-    const sessOptions = (appState.sessionsList || [])
-      .map(s => `<option value="${escHtml(s.id)}" ${s.id === appState.sessionId ? 'selected' : ''}>${escHtml(s.title)} (${escHtml(s.workspaceName)})</option>`)
-      .join('');
+    const sessOptions = [
+      `<option value="" ${!appState.sessionId ? 'selected' : ''}>${escHtml(t('selectSessionPlaceholder'))}</option>`,
+      ...(appState.sessionsList || []).map(
+        s => `<option value="${escHtml(s.id)}" ${s.id === appState.sessionId ? 'selected' : ''}>${escHtml(s.title)} (${escHtml(s.workspaceName)})</option>`
+      ),
+    ].join('');
+
+    const activeTitle = appState.sessionData?.meta?.title || '';
+    const shortId = appState.sessionId ? appState.sessionId.slice(0, 8) : '';
+    const viewingChildInAux = isAuxPane && appState.hostSessionId && appState.sessionId && appState.sessionId !== appState.hostSessionId;
 
     topbar.innerHTML = `
       <div class="topbar-left">
         <span class="brand"><span class="brand-dot"></span>${escHtml(t('brand'))}</span>
         <div class="nav-tabs topbar-tabs">
-          <button class="nav-tab ${appState.page === 'insights' ? 'active' : ''}" data-nav="insights">${escHtml(t('navInsights'))}</button>
+          ${!isAuxPane ? `<button class="nav-tab ${appState.page === 'insights' ? 'active' : ''}" data-nav="insights">${escHtml(t('navInsights'))}</button>` : ''}
           <button class="nav-tab ${appState.page === 'context' ? 'active' : ''}" data-nav="context">${escHtml(t('navContext'))}</button>
           ${showFleetTab ? `<button class="nav-tab ${appState.page === 'fleet' ? 'active' : ''}" data-nav="fleet">${escHtml(t('navFleet'))}</button>` : ''}
         </div>
-        ${(appState.page === 'context' || appState.page === 'fleet') && appState.sessionsList.length > 0 ? `
-          <select class="select session-select" id="top-session-select">${sessOptions}</select>
-        ` : ''}
+        ${isAuxPane
+          ? (shortId
+              ? `<span class="pill mono" title="${escHtml(appState.sessionId)}" style="max-width:220px;overflow:hidden;text-overflow:ellipsis">${escHtml(activeTitle || shortId)}${activeTitle ? ` · ${escHtml(shortId)}` : ''}</span>`
+              : '')
+            + (viewingChildInAux
+              ? `<button class="btn btn-sm" id="btn-back-host-session">← ${escHtml(t('backToCurrentSession'))}</button>`
+              : '')
+          : ((appState.page === 'context' || appState.page === 'fleet') && appState.sessionsList.length > 0
+              ? `<select class="select session-select" id="top-session-select">${sessOptions}</select>`
+              : '')
+        }
       </div>
       <div class="topbar-right">
         <button class="btn btn-sm" id="btn-refresh">${escHtml(t('refresh'))}</button>
@@ -112,6 +131,7 @@
     topbar.querySelectorAll('[data-nav]').forEach(btn => {
       btn.addEventListener('click', () => {
         const nextPage = btn.getAttribute('data-nav');
+        if (isAuxPane && nextPage === 'insights') return;
         if (nextPage !== appState.page) {
           appState.page = nextPage;
           renderTopbar();
@@ -120,6 +140,13 @@
       });
     });
 
+    const backHostBtn = topbar.querySelector('#btn-back-host-session');
+    if (backHostBtn) {
+      backHostBtn.addEventListener('click', () => {
+        if (appState.hostSessionId) openContextFor(appState.hostSessionId);
+      });
+    }
+
     const sessSel = topbar.querySelector('#top-session-select');
     if (sessSel) {
       sessSel.addEventListener('change', () => {
@@ -127,10 +154,13 @@
         appState.timeline.pinnedSeq = -1;
         appState.timeline.hoveredSeq = -1;
         appState.browser.openItems.clear();
+        appState.sessionData = null;
+        appState.stepData = null;
         appState.fleet.data = null;
+        appState.fleet.signature = '';
         appState.fleet.selectedAgent = '';
         appState.fleet.selectedTask = '';
-        if (appState.page === 'fleet') loadFleet();
+        if (appState.page === 'fleet') loadFleet(true);
         else loadContextSession();
       });
     }
@@ -195,13 +225,55 @@
     if (!patch || patch.browserBaseline) appState.browser.baseline = appState.prefs.browserBaseline;
   }
 
+  function syncHostConversation(nextHostId) {
+    if (!isAuxPane) return false;
+    const clean = typeof nextHostId === 'string' ? nextHostId.trim() : '';
+    if (!clean || clean === appState.hostSessionId) return false;
+    appState.hostSessionId = clean;
+    appState.sessionId = clean;
+    appState.emptyReason = '';
+    appState.sessionData = null;
+    appState.stepData = null;
+    appState.timeline.pinnedSeq = -1;
+    appState.timeline.hoveredSeq = -1;
+    appState.browser.openItems.clear();
+    appState.fleet.data = null;
+    appState.fleet.signature = '';
+    appState.fleet.selectedAgent = '';
+    appState.fleet.selectedTask = '';
+    if (appState.page === 'insights') appState.page = 'context';
+    renderTopbar();
+    return true;
+  }
+
+  function renderSessionEmptyMessage() {
+    const { t, escHtml } = AGY.i18n;
+    if (appState.emptyReason === 'no_transcript_yet') {
+      const idBadge = appState.sessionId ? ` <span class="pill mono">${escHtml(appState.sessionId.slice(0, 8))}</span>` : '';
+      return `<div class="card"><div class="empty-state">${escHtml(t('emptyWaitingTranscript'))}${idBadge}</div></div>`;
+    }
+    if (isAuxPane) {
+      return `<div class="card"><div class="empty-state">${escHtml(t('emptyNoHostConversation'))}</div></div>`;
+    }
+    return `<div class="card"><div class="empty-state">${escHtml(t('emptySelectSession'))}</div></div>`;
+  }
+
   async function loadInsights(force = false) {
+    if (isAuxPane) return;
     const query = Object.assign({}, appState.insightsFilters, force ? { force: 1 } : {});
     try {
       const data = await AGY.bridge.apiFetch(`/api/insights${qs(query)}`);
       appState.insightsData = data;
-      if (data.sessions && data.sessions.length > 0 && !appState.sessionId) {
-        appState.sessionId = data.sessions[0].id;
+      if (Array.isArray(data.sessions)) {
+        appState.sessionsList = data.sessions.map(s => ({
+          id: s.id,
+          title: s.title,
+          workspaceName: s.workspaceName,
+          lastMs: s.lastMs,
+          latestModelLabel: s.latestModelLabel,
+          windowUsagePct: s.windowUsagePct,
+          billableTokens: s.billableTokens,
+        }));
       }
       renderMain();
     } catch (err) {
@@ -210,34 +282,106 @@
   }
 
   async function loadContextSession() {
-    try {
-      const stepParam = appState.timeline.pinnedSeq >= 0 ? appState.timeline.pinnedSeq : '';
-      const payload = await AGY.bridge.apiFetch(`/api/session${qs({ id: appState.sessionId, step: stepParam })}`);
-      appState.sessionsList = payload.sessions || [];
-      appState.sessionData = payload.session || null;
-      if (appState.sessionData) appState.sessionData.fleet = payload.fleet || null;
-      if (appState.sessionData && !appState.sessionId) {
-        appState.sessionId = appState.sessionData.id;
+    if (isAuxPane) {
+      const hostConv = AGY.bridge.getHostConversationId();
+      if (hostConv && hostConv !== appState.hostSessionId) {
+        syncHostConversation(hostConv);
+      }
+    }
+
+    const targetId = (appState.sessionId || '').trim();
+    const myToken = ++sessionLoadToken;
+
+    if (!targetId) {
+      appState.sessionData = null;
+      appState.stepData = null;
+      appState.emptyReason = isAuxPane ? 'missing_conversation_id' : 'select_session';
+      if (!isAuxPane && appState.sessionsList.length === 0) {
+        try {
+          const payload = await AGY.bridge.apiFetch('/api/session');
+          if (myToken !== sessionLoadToken) return;
+          appState.sessionsList = payload.sessions || [];
+        } catch {
+          // ignore
+        }
       }
       renderTopbar();
       renderMain();
-      if (appState.sessionData) {
-        await loadStepBrowser(appState.timeline.pinnedSeq);
+      return;
+    }
+
+    try {
+      const stepParam = appState.timeline.pinnedSeq >= 0 ? appState.timeline.pinnedSeq : '';
+      const payload = await AGY.bridge.apiFetch(`/api/session${qs({ id: targetId, step: stepParam })}`);
+      if (myToken !== sessionLoadToken) return;
+      appState.sessionsList = payload.sessions || [];
+      if (payload.empty || !payload.session) {
+        appState.sessionData = null;
+        appState.stepData = null;
+        appState.emptyReason = payload.reason || 'no_transcript_yet';
+        renderTopbar();
+        renderMain();
+        return;
       }
+      appState.emptyReason = '';
+      appState.sessionData = payload.session;
+      appState.sessionData.fleet = payload.fleet || null;
+      renderTopbar();
+      renderMain();
+      await loadStepBrowser(appState.timeline.pinnedSeq);
     } catch (err) {
+      if (myToken !== sessionLoadToken) return;
       showError(err);
     }
   }
 
   async function loadFleet(force = false) {
-    if (!appState.sessionId) return;
+    if (isAuxPane) {
+      const hostConv = AGY.bridge.getHostConversationId();
+      if (hostConv && hostConv !== appState.hostSessionId) {
+        syncHostConversation(hostConv);
+      }
+    }
+
+    const targetId = (appState.sessionId || '').trim();
+    const myToken = ++sessionLoadToken;
+
+    if (!targetId) {
+      appState.fleet.data = null;
+      appState.fleet.signature = '';
+      appState.emptyReason = isAuxPane ? 'missing_conversation_id' : 'select_session';
+      if (!isAuxPane && appState.sessionsList.length === 0) {
+        try {
+          const payload = await AGY.bridge.apiFetch('/api/fleet');
+          if (myToken !== sessionLoadToken) return;
+          appState.sessionsList = payload.sessions || [];
+        } catch {
+          // ignore
+        }
+      }
+      renderTopbar();
+      renderMain();
+      return;
+    }
+
     try {
-      const data = await AGY.bridge.apiFetch(`/api/fleet${qs({ id: appState.sessionId })}`);
-      appState.fleet.data = data;
+      const data = await AGY.bridge.apiFetch(`/api/fleet${qs({ id: targetId })}`);
+      if (myToken !== sessionLoadToken) return;
       if (Array.isArray(data?.sessions) && data.sessions.length > 0) {
         appState.sessionsList = data.sessions;
       }
+      if (data?.empty) {
+        appState.fleet.data = null;
+        appState.fleet.signature = '';
+        appState.emptyReason = data.reason || 'no_transcript_yet';
+        renderTopbar();
+        renderMain();
+        return;
+      }
+      appState.emptyReason = '';
+      appState.fleet.data = data;
       const signature = JSON.stringify([
+        targetId,
         data?.agents?.map(agent => [agent.id, agent.steps, agent.requests, agent.lastMs, agent.billableTokens, agent.status]),
         data?.tasks?.map(task => [task.id, task.status, task.completedMs]),
         data?.timeline?.length,
@@ -245,25 +389,27 @@
       ]);
       const sameData = signature === appState.fleet.signature;
       appState.fleet.signature = signature;
-      if (data?.currentId) {
-        appState.sessionId = data.currentId;
-        if (!appState.fleet.selectedAgent) appState.fleet.selectedAgent = data.currentId;
+      if (data?.currentId && !appState.fleet.selectedAgent) {
+        appState.fleet.selectedAgent = data.currentId;
       }
       renderTopbar();
       if (!force && sameData && document.getElementById('fleet-page-host')) return;
       renderMain();
     } catch (err) {
+      if (myToken !== sessionLoadToken) return;
       showError(err);
     }
   }
 
   async function loadStepBrowser(seq) {
-    if (!appState.sessionId) return;
+    const targetId = (appState.sessionId || '').trim();
+    if (!targetId) return;
     try {
       const data = await AGY.bridge.apiFetch(
-        `/api/step${qs({ id: appState.sessionId, step: seq >= 0 ? seq : '', baseline: appState.browser.baseline })}`
+        `/api/step${qs({ id: targetId, step: seq >= 0 ? seq : '', baseline: appState.browser.baseline })}`
       );
-      appState.stepData = data;
+      if (targetId !== appState.sessionId) return;
+      appState.stepData = data?.empty ? null : data;
       const host = document.getElementById('ctx-browser-host');
       if (host) renderBrowserSection(host);
     } catch {
@@ -282,7 +428,7 @@
     const main = document.getElementById('main-content');
     if (!main) return;
 
-    if (appState.page === 'insights') {
+    if (appState.page === 'insights' && !isAuxPane) {
       AGY.views.insights.render(main, appState.insightsData, appState.insightsFilters, {
         onRangeChange: (nextRange) => {
           appState.insightsFilters.range = nextRange;
@@ -303,19 +449,17 @@
           renderSettings();
         },
         onOpenSession: (convId) => {
-          appState.sessionId = convId;
-          appState.page = 'context';
-          appState.timeline.pinnedSeq = -1;
-          appState.timeline.hoveredSeq = -1;
-          appState.browser.openItems.clear();
-          renderTopbar();
-          loadContextSession();
+          openContextFor(convId);
         },
       });
       return;
     }
 
     if (appState.page === 'fleet') {
+      if (!appState.fleet.data && appState.emptyReason) {
+        main.innerHTML = renderSessionEmptyMessage();
+        return;
+      }
       main.innerHTML = `<div id="fleet-page-host"></div>`;
       renderFleetPage();
       return;
@@ -323,7 +467,7 @@
 
     // Context Dashboard (DSH Layout)
     if (!appState.sessionData) {
-      main.innerHTML = `<div class="card"><div class="empty-state">${AGY.i18n.escHtml(AGY.i18n.t('noData'))}</div></div>`;
+      main.innerHTML = renderSessionEmptyMessage();
       return;
     }
 
@@ -376,11 +520,13 @@
         appState.settingsOpen = true;
         renderSettings();
       },
-      onGoInsights: () => {
-        appState.page = 'insights';
-        renderTopbar();
-        loadActivePage();
-      },
+      onGoInsights: !isAuxPane
+        ? () => {
+            appState.page = 'insights';
+            renderTopbar();
+            loadActivePage();
+          }
+        : null,
     });
   }
 
@@ -388,6 +534,10 @@
     const host = document.getElementById('fleet-page-host');
     if (!host) return;
     if (!appState.fleet.data) {
+      if (!appState.sessionId || appState.emptyReason) {
+        host.innerHTML = renderSessionEmptyMessage();
+        return;
+      }
       host.innerHTML = `<div class="card"><div class="empty-state">${AGY.i18n.escHtml(AGY.i18n.t('commonLoading'))}</div></div>`;
       loadFleet();
       return;
@@ -454,12 +604,16 @@
   function openContextFor(id) {
     if (!id) return;
     appState.sessionId = id;
+    appState.emptyReason = '';
     appState.page = 'context';
+    appState.sessionData = null;
+    appState.stepData = null;
     appState.timeline.pinnedSeq = -1;
     appState.timeline.hoveredSeq = -1;
     appState.browser.openItems.clear();
     appState.fleet.selectedAgent = id;
     appState.fleet.data = null;
+    appState.fleet.signature = '';
     renderTopbar();
     loadContextSession();
   }
@@ -644,6 +798,18 @@
 
   async function bootstrap() {
     AGY.bridge.initThemeSync();
+    if (isAuxPane) {
+      const hostConv = AGY.bridge.getHostConversationId();
+      if (hostConv) {
+        appState.hostSessionId = hostConv;
+        appState.sessionId = hostConv;
+      }
+      AGY.bridge.onConversationChange((nextId) => {
+        if (syncHostConversation(nextId)) {
+          loadActivePage(true);
+        }
+      });
+    }
     try {
       appState.prefs = await AGY.bridge.apiFetch('/api/prefs');
     } catch {
@@ -658,17 +824,15 @@
       if (document.hidden || appState.timeline.hoveredSeq >= 0) return;
       const active = document.activeElement;
       if (active && /^(INPUT|TEXTAREA|SELECT)$/.test(active.tagName)) return;
-      const hostConv = AGY.bridge.getHostConversationId();
-      if (hostConv && viewMode === 'aux' && hostConv !== appState.hostSessionId) {
-        appState.hostSessionId = hostConv;
-        appState.sessionId = hostConv;
-        appState.timeline.pinnedSeq = -1;
-        if (appState.page === 'insights') {
-          appState.page = 'context';
-          renderTopbar();
+      if (isAuxPane) {
+        const hostConv = AGY.bridge.getHostConversationId();
+        if (hostConv && hostConv !== appState.hostSessionId) {
+          syncHostConversation(hostConv);
+          loadActivePage(true);
+          return;
         }
       }
-      if (appState.page === 'insights') {
+      if (appState.page === 'insights' && !isAuxPane) {
         loadInsights();
       } else if (appState.page === 'fleet') {
         loadFleet();

@@ -149,14 +149,33 @@ export function createRouter({ version = '0.1.0' } = {}) {
     };
   }
 
+  function mapSessionOptions(sessions) {
+    return (sessions || []).map(s => ({
+      id: s.id,
+      title: s.title,
+      workspaceName: s.workspaceName,
+      lastMs: s.lastMs,
+      latestModelLabel: s.latestModelLabel,
+      windowUsagePct: s.windowUsagePct,
+      billableTokens: s.totalBillableTokens,
+    }));
+  }
+
   async function handleSession(rawQuery) {
     const q = normalizeQuery(rawQuery);
     const sessions = await projectionStore.listSessions();
-    const convId = q.id || sessions[0]?.id || '';
+    const sessionOptions = mapSessionOptions(sessions);
+    const convId = (q.id || '').trim();
     if (!convId) {
       return {
         status: 200,
-        body: { empty: true, sessions: [], session: null },
+        body: {
+          empty: true,
+          reason: 'missing_conversation_id',
+          sessions: sessionOptions,
+          fleet: null,
+          session: null,
+        },
       };
     }
 
@@ -169,8 +188,15 @@ export function createRouter({ version = '0.1.0' } = {}) {
 
     if (!overview) {
       return {
-        status: 404,
-        body: { error: 'Conversation not found', id: convId },
+        status: 200,
+        body: {
+          empty: true,
+          reason: 'no_transcript_yet',
+          id: convId,
+          sessions: sessionOptions,
+          fleet: null,
+          session: null,
+        },
       };
     }
 
@@ -178,15 +204,7 @@ export function createRouter({ version = '0.1.0' } = {}) {
       status: 200,
       body: {
         empty: false,
-        sessions: sessions.map(s => ({
-          id: s.id,
-          title: s.title,
-          workspaceName: s.workspaceName,
-          lastMs: s.lastMs,
-          latestModelLabel: s.latestModelLabel,
-          windowUsagePct: s.windowUsagePct,
-          billableTokens: s.totalBillableTokens,
-        })),
+        sessions: sessionOptions,
         fleet: fleetSummary,
         session: overview,
       },
@@ -196,27 +214,45 @@ export function createRouter({ version = '0.1.0' } = {}) {
   async function handleFleet(rawQuery) {
     const q = normalizeQuery(rawQuery);
     const sessions = await projectionStore.listSessions();
-    const convId = q.id || sessions[0]?.id || '';
+    const sessionOptions = mapSessionOptions(sessions);
+    const convId = (q.id || '').trim();
     if (!convId) {
-      return { status: 200, body: { empty: true, agents: [], edges: [], tasks: [], timeline: [], summary: null } };
+      return {
+        status: 200,
+        body: {
+          empty: true,
+          reason: 'missing_conversation_id',
+          sessions: sessionOptions,
+          agents: [],
+          edges: [],
+          tasks: [],
+          timeline: [],
+          summary: null,
+        },
+      };
     }
     const data = await fleetStore.getFleet(convId);
     if (!data) {
-      return { status: 404, body: { error: 'Conversation not found', id: convId } };
+      return {
+        status: 200,
+        body: {
+          empty: true,
+          reason: 'no_transcript_yet',
+          id: convId,
+          sessions: sessionOptions,
+          agents: [],
+          edges: [],
+          tasks: [],
+          timeline: [],
+          summary: null,
+        },
+      };
     }
     return {
       status: 200,
       body: {
         empty: false,
-        sessions: sessions.map(s => ({
-          id: s.id,
-          title: s.title,
-          workspaceName: s.workspaceName,
-          lastMs: s.lastMs,
-          latestModelLabel: s.latestModelLabel,
-          windowUsagePct: s.windowUsagePct,
-          billableTokens: s.totalBillableTokens,
-        })),
+        sessions: sessionOptions,
         ...data,
       },
     };
@@ -224,17 +260,17 @@ export function createRouter({ version = '0.1.0' } = {}) {
 
   async function handleStep(rawQuery) {
     const q = normalizeQuery(rawQuery);
-    const sessions = await projectionStore.listSessions();
-    const convId = q.id || sessions[0]?.id || '';
+    const convId = (q.id || '').trim();
     if (!convId) {
-      return { status: 404, body: { error: 'No conversation available' } };
+      return { status: 200, body: { empty: true, reason: 'missing_conversation_id', categories: [], dna: { ribbon: [], list: [], totalTokens: 0 } } };
     }
+    const sessions = await projectionStore.listSessions();
     const meta = sessions.find(s => s.id === convId) || null;
     const seq = q.step !== undefined && q.step !== '' ? Number(q.step) : -1;
     const baseline = q.baseline === 'prev_step' ? 'prev_step' : 'prev_turn';
     const data = await detailStore.getStepBrowser(convId, meta, Number.isFinite(seq) ? seq : -1, baseline);
     if (!data) {
-      return { status: 404, body: { error: 'Conversation not found', id: convId } };
+      return { status: 200, body: { empty: true, reason: 'no_transcript_yet', id: convId, categories: [], dna: { ribbon: [], list: [], totalTokens: 0 } } };
     }
     return { status: 200, body: data };
   }
