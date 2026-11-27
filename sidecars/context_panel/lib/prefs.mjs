@@ -16,7 +16,7 @@ export const DEFAULT_PREFS = Object.freeze({
 
 const ALLOWED_ENUMS = {
   lang: new Set(['zh', 'en']),
-  insightsRange: new Set(['today', '7d', '30d', 'all']),
+  insightsRange: new Set(['today', 'weekly_quota', '7d', '30d', 'all']),
   insightsSort: new Set(['recent', 'tokens', 'context', 'cost']),
   timelineGranularity: new Set(['step', 'turn']),
   timelineMode: new Set(['total', 'delta', 'overview']),

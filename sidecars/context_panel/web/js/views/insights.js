@@ -5,11 +5,43 @@
     '#14b8a6', '#6366f1', '#f59e0b', '#ec4899', '#3b82f6', '#22c55e', '#a855f7', '#f97316',
   ];
 
-  function computeRangeLabel(range, selectedDay) {
+  function fmtCycleStamp(ms) {
+    if (!(ms > 0)) return '';
+    const d = new Date(ms);
+    if (Number.isNaN(d.getTime())) return '';
+    const pad = (v) => String(v).padStart(2, '0');
+    return `${pad(d.getMonth() + 1)}/${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+
+  function fmtCountdown(resetAt) {
+    if (!(resetAt > 0)) return '';
+    const diffMs = resetAt - Date.now();
+    if (diffMs <= 0) return '0m';
+    const totalMinutes = Math.floor(diffMs / 60000);
+    const days = Math.floor(totalMinutes / (24 * 60));
+    const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
+    const minutes = totalMinutes % 60;
+    if (days > 0) return `${days}d${hours}h`;
+    if (hours > 0) return `${hours}h${minutes}m`;
+    return `${minutes}m`;
+  }
+
+  function computeRangeLabel(range, selectedDay, weeklyQuota) {
     const fmt = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
     if (selectedDay) return selectedDay;
     const today = new Date();
     if (range === 'today') return `${fmt(today)} → ${fmt(today)}`;
+    if (range === 'weekly_quota') {
+      if (weeklyQuota?.cycleStartMs && weeklyQuota?.cycleEndMs) {
+        if (weeklyQuota.source === 'official') {
+          return `${fmtCycleStamp(weeklyQuota.cycleStartMs)} → ${fmtCycleStamp(weeklyQuota.cycleEndMs)}`;
+        }
+        const s = new Date(weeklyQuota.cycleStartMs);
+        const e = new Date(weeklyQuota.cycleEndMs - 1);
+        return `${fmt(s)} → ${fmt(e)} (${AGY.i18n.t('weeklyQuotaFallbackTag')})`;
+      }
+      return AGY.i18n.t('rangeWeeklyQuota');
+    }
     if (range === '7d') {
       const s = new Date(today);
       s.setDate(s.getDate() - 6);
@@ -21,6 +53,47 @@
       return `${fmt(s)} → ${fmt(today)}`;
     }
     return AGY.i18n.t('rangeAll');
+  }
+
+  function renderWeeklyQuotaBar(weeklyQuota, activePool) {
+    const { escHtml, t } = AGY.i18n;
+    if (!weeklyQuota) return '';
+    const pools = Array.isArray(weeklyQuota.pools) ? weeklyQuota.pools : [];
+    const currentPool = activePool || weeklyQuota.selectedPool || 'all';
+    const parts = [];
+
+    if (pools.length > 0) {
+      parts.push(`
+        <button class="dsh-quota-chip ${currentPool === 'all' ? 'active' : ''}" data-qpool="all">
+          <span>${escHtml(t('weeklyQuotaAllPools'))}</span>
+        </button>
+      `);
+      for (const p of pools) {
+        const pct = p.remainingPct;
+        const dotClass = pct == null ? 'muted' : pct >= 50 ? 'ok' : pct >= 20 ? 'warn' : 'low';
+        const pctText = pct != null ? `${t('weeklyQuotaRemaining')} ${pct}%` : '';
+        const countdown = p.resetAt && p.resetAt > Date.now() ? fmtCountdown(p.resetAt) : '';
+        const resetStamp = p.resetAt ? fmtCycleStamp(p.resetAt) : '';
+        const metaText = countdown
+          ? `${countdown} ${t('weeklyQuotaResetIn')} (${resetStamp})`
+          : (p.remainingFraction === 1 && !p.resetAt ? t('weeklyQuotaUntouched') : '');
+        parts.push(`
+          <button class="dsh-quota-chip ${currentPool === p.pool ? 'active' : ''}" data-qpool="${escHtml(p.pool)}" title="${escHtml(p.resetTime || p.label)}">
+            <span class="dsh-quota-dot ${dotClass}"></span>
+            <span>${escHtml(p.label)}</span>
+            ${pctText ? `<span class="mono">${escHtml(pctText)}</span>` : ''}
+            ${metaText ? `<span class="dsh-quota-meta mono">· ${escHtml(metaText)}</span>` : ''}
+          </button>
+        `);
+      }
+    }
+
+    if (weeklyQuota.source === 'fallback_calendar_week') {
+      parts.push(`<span class="dsh-quota-note">${escHtml(t('weeklyQuotaFallbackHint'))}</span>`);
+    }
+
+    if (parts.length === 0) return '';
+    return `<div class="dsh-quota-bar">${parts.join('')}</div>`;
   }
 
   function buildProjectRankings(sessions) {
@@ -86,8 +159,13 @@
     const timing = data.timing || {};
     const comp = data.composition || {};
     const range = filters.range || data.range || '30d';
+    const quotaPool = filters.quotaPool || data.quotaPool || 'all';
+    const weeklyQuota = data.weeklyQuota || null;
     const hmMetric = filters.hmMetric || 'tokens';
-    const hasActiveChips = Boolean(filters.day || filters.skill || filters.tool || filters.cmd || filters.workspace || filters.q);
+    const hasActiveChips = Boolean(
+      filters.day || filters.skill || filters.tool || filters.cmd || filters.workspace || filters.q ||
+      (range === 'weekly_quota' && quotaPool && quotaPool !== 'all')
+    );
     const isZh = getLang() === 'zh';
 
     const projects = buildProjectRankings(data.sessions).map(p => Object.assign({}, p, { _barVal: p.tokens || p.count }));
@@ -106,7 +184,10 @@
     ].filter(Boolean);
     const speedTitle = speedLines.join('\n');
 
-    const dateSpanLabel = computeRangeLabel(range, filters.day);
+    const dateSpanLabel = computeRangeLabel(range, filters.day, weeklyQuota);
+    const dateSpanTitle = range === 'weekly_quota' && weeklyQuota?.source === 'official'
+      ? ` title="${escHtml(t('weeklyQuotaOfficialSource'))}"`
+      : '';
 
     container.innerHTML = `
       <!-- DSH Insights Page Header -->
@@ -114,18 +195,20 @@
         <div class="dsh-ins-title-group">
           <span class="dsh-page-title">${escHtml(t('navInsights'))}</span>
           <button class="dsh-chip dsh-chip-btn" id="ins-open-settings">⚙ ${escHtml(t('pluginSettings'))}</button>
-          <span class="dsh-chip mono">${escHtml(dateSpanLabel)}</span>
+          <span class="dsh-chip mono"${dateSpanTitle}>${escHtml(dateSpanLabel)}</span>
           ${filters.day ? `<button class="dsh-chip dsh-chip-btn" id="ins-clear-day" style="color:var(--accent)">✕ ${escHtml(filters.day)}</button>` : ''}
         </div>
         <div class="nav-tabs">
           ${[
             { key: 'today', label: t('rangeToday') },
+            { key: 'weekly_quota', label: t('rangeWeeklyQuota') },
             { key: '7d', label: t('range7d') },
             { key: '30d', label: t('range30d') },
             { key: 'all', label: t('rangeAll') },
           ].map(r => `<button class="nav-tab ${range === r.key ? 'active' : ''}" data-irange="${r.key}">${escHtml(r.label)}</button>`).join('')}
         </div>
       </div>
+      ${range === 'weekly_quota' && !filters.day ? renderWeeklyQuotaBar(weeklyQuota, quotaPool) : ''}
 
       <!-- Row 1: 3-Column Bento (2x3 KPIs | 7-Day Usage | Activity Heatmap) -->
       <div class="dsh-ins-top">
@@ -267,6 +350,7 @@
         <div class="card-header">
           <div class="filter-bar">
             <span class="card-title">${escHtml(t('sessionsTitle'))} <span class="pill mono">${(data.sessions || []).length}</span></span>
+            ${range === 'weekly_quota' && quotaPool && quotaPool !== 'all' ? `<span class="pill pill-accent">${escHtml(quotaPool === 'gemini' ? 'Gemini' : 'Claude / GPT')}</span>` : ''}
             ${filters.workspace ? `<span class="pill pill-accent">${escHtml(filters.workspace)}</span>` : ''}
             ${filters.skill ? `<span class="pill pill-accent">Skill: ${escHtml(filters.skill)}</span>` : ''}
             ${filters.tool ? `<span class="pill pill-accent">Tool: ${escHtml(filters.tool)}</span>` : ''}
@@ -377,6 +461,12 @@
       btn.addEventListener('click', () => callbacks?.onRangeChange?.(btn.getAttribute('data-irange')));
     });
 
+    container.querySelectorAll('[data-qpool]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        callbacks?.onFilterChange?.({ quotaPool: btn.getAttribute('data-qpool') || 'all', day: '' });
+      });
+    });
+
     container.querySelectorAll('[data-hm-metric]').forEach(btn => {
       btn.addEventListener('click', () => callbacks?.onLocalFilterChange?.({ hmMetric: btn.getAttribute('data-hm-metric') }));
     });
@@ -394,7 +484,7 @@
     }
 
     container.querySelector('#ins-clear')?.addEventListener('click', () => {
-      callbacks?.onFilterChange?.({ day: '', skill: '', tool: '', cmd: '', workspace: '', q: '' });
+      callbacks?.onFilterChange?.({ day: '', skill: '', tool: '', cmd: '', workspace: '', q: '', quotaPool: 'all' });
     });
 
     container.querySelectorAll('[data-rproj]').forEach(el => {

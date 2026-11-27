@@ -4,7 +4,8 @@ import { formatLocalDateKey, resolveBrainDir, resolveDataDir, toMillis } from '.
 import { parseTranscriptFile } from './parser.mjs';
 import { getModelSpec } from './pricing.mjs';
 import { readConversationMetaMap } from './sqlite-meta.mjs';
-import { getGeneratorMetadata } from './ls-rpc.mjs';
+import { getGeneratorMetadata, getUserQuotaSummary } from './ls-rpc.mjs';
+import { inferModelQuotaPool, resolveWeeklyQuotaWindow } from './quota.mjs';
 import {
   MIN_OUTPUT_TOKENS_FOR_SPEED,
   MIN_STREAM_MS,
@@ -15,7 +16,9 @@ import {
   parseOfficialContext,
 } from './official-context.mjs';
 
-const CACHE_VERSION = 10;
+const CACHE_VERSION = 11;
+const SLICE_MS = 5 * 60 * 1000;
+const HOUR_MS = 60 * 60 * 1000;
 
 function getCachePath() {
   const live = Boolean(process.env.ANTIGRAVITY_LS_ADDRESS && process.env.ANTIGRAVITY_CSRF_TOKEN);
@@ -36,6 +39,7 @@ async function buildConversationProjection(convId, transcriptPath, meta) {
   const official = parseOfficialContext(officialRaw, { modelId: transcriptModel });
 
   const daily = {}; // dateKey -> { inputTokens, cacheReadTokens, outputTokens, billableTokens, cost, requests, turnsSet, toolCalls }
+  const slices = {}; // `${bucketMs}|${pool}` -> { t, p, in, cr, ceIn, ceCr, out, bill, cost, req, turns, tools }
   const skills = {}; // skillName -> { count, lastUsedMs }
   const tools = {}; // toolName -> { count, lastUsedMs }
   const commands = {}; // program -> { count, failed, lastUsedMs }
@@ -79,6 +83,7 @@ async function buildConversationProjection(convId, transcriptPath, meta) {
   let latestWindow = 0;
   let prevStepMs = 0;
   let prevStepType = '';
+  let lastPool = '';
   let responseThinkingEst = 0;
   let responseAnswerEst = 0;
   let responseToolEst = 0;
@@ -119,7 +124,49 @@ async function buildConversationProjection(convId, transcriptPath, meta) {
     return daily[dk];
   };
 
+  const ensureSlice = (createdMs, pool = 'other') => {
+    if (!(createdMs > 0)) return null;
+    const t = Math.floor(createdMs / SLICE_MS) * SLICE_MS;
+    const p = pool || 'other';
+    const key = `${t}|${p}`;
+    if (!slices[key]) {
+      slices[key] = {
+        t,
+        p,
+        in: 0,
+        cr: 0,
+        ceIn: 0,
+        ceCr: 0,
+        out: 0,
+        bill: 0,
+        cost: 0,
+        req: 0,
+        turns: 0,
+        tools: 0,
+      };
+    }
+    return slices[key];
+  };
+
+  const recordBucketCount = (entry, createdMs, pool = 'other', isError = null) => {
+    if (!entry || !(createdMs > 0)) return;
+    if (!entry.buckets) entry.buckets = {};
+    const key = `${Math.floor(createdMs / HOUR_MS) * HOUR_MS}|${pool || 'other'}`;
+    if (isError === null) {
+      entry.buckets[key] = (entry.buckets[key] || 0) + 1;
+    } else {
+      const prev =
+        entry.buckets[key] && typeof entry.buckets[key] === 'object'
+          ? entry.buckets[key]
+          : { count: 0, failed: 0 };
+      prev.count++;
+      if (isError) prev.failed++;
+      entry.buckets[key] = prev;
+    }
+  };
+
   const seenTurnDays = new Set();
+  const seenTurnSlices = new Set();
 
   for (let idx = 0; idx < parsed.steps.length; idx++) {
     const s = parsed.steps[idx];
@@ -141,6 +188,23 @@ async function buildConversationProjection(convId, transcriptPath, meta) {
         if (!seenTurnDays.has(turnKey)) {
           seenTurnDays.add(turnKey);
           dayEntry.turns++;
+        }
+      }
+      let turnPool = lastPool || 'other';
+      for (let look = idx + 1; look < parsed.steps.length; look++) {
+        const nextS = parsed.steps[look];
+        if (nextS.type === 'USER_INPUT') break;
+        if (nextS.type === 'PLANNER_RESPONSE' && nextS.model) {
+          turnPool = inferModelQuotaPool(nextS.model);
+          break;
+        }
+      }
+      const turnSlice = ensureSlice(s.createdMs, turnPool);
+      if (turnSlice) {
+        const sliceTurnKey = `${turnSlice.t}:${turnSlice.p}:${s.turnIndex}`;
+        if (!seenTurnSlices.has(sliceTurnKey)) {
+          seenTurnSlices.add(sliceTurnKey);
+          turnSlice.turns++;
         }
       }
       prevStepMs = s.createdMs || prevStepMs;
@@ -180,6 +244,18 @@ async function buildConversationProjection(convId, transcriptPath, meta) {
         dayEntry.billableTokens += s.totalBillableTokens;
         dayEntry.cost += s.cost;
         dayEntry.requests++;
+      }
+
+      const cpPool = inferModelQuotaPool(s.model || latestModel);
+      if (cpPool !== 'other') lastPool = cpPool;
+      const cpSlice = ensureSlice(s.createdMs, cpPool);
+      if (cpSlice) {
+        cpSlice.in += s.inputTokens;
+        cpSlice.cr += s.cacheReadTokens;
+        cpSlice.out += s.outputTokens;
+        cpSlice.bill += s.totalBillableTokens;
+        cpSlice.cost += s.cost;
+        cpSlice.req++;
       }
 
       billableBuckets.injected += s.totalPromptTokens;
@@ -287,19 +363,36 @@ async function buildConversationProjection(convId, transcriptPath, meta) {
         dayEntry.requests++;
       }
 
+      const prPool = inferModelQuotaPool(s.model || latestModel);
+      if (prPool !== 'other') lastPool = prPool;
+      const prSlice = ensureSlice(s.createdMs, prPool);
+      if (prSlice) {
+        prSlice.in += s.inputTokens;
+        prSlice.cr += s.cacheReadTokens;
+        prSlice.ceIn += s.inputTokens;
+        prSlice.ceCr += s.cacheReadTokens;
+        prSlice.out += s.outputTokens;
+        prSlice.bill += s.totalBillableTokens;
+        prSlice.cost += s.cost;
+        prSlice.req++;
+      }
+
       for (const tc of s.toolCalls || []) {
         totalToolCalls++;
-        if (!tools[tc.name]) tools[tc.name] = { count: 0, lastUsedMs: 0, daily: {} };
+        if (!tools[tc.name]) tools[tc.name] = { count: 0, lastUsedMs: 0, daily: {}, buckets: {} };
         tools[tc.name].count++;
         tools[tc.name].daily[s.dateKey] = (tools[tc.name].daily[s.dateKey] || 0) + 1;
+        recordBucketCount(tools[tc.name], s.createdMs, prPool, null);
         if (s.createdMs > tools[tc.name].lastUsedMs) tools[tc.name].lastUsedMs = s.createdMs;
         if (dayEntry) dayEntry.toolCalls++;
+        if (prSlice) prSlice.tools++;
 
         if (tc.skill) {
           const sk = tc.skill.skillName;
-          if (!skills[sk]) skills[sk] = { count: 0, lastUsedMs: 0, daily: {} };
+          if (!skills[sk]) skills[sk] = { count: 0, lastUsedMs: 0, daily: {}, buckets: {} };
           skills[sk].count++;
           skills[sk].daily[s.dateKey] = (skills[sk].daily[s.dateKey] || 0) + 1;
+          recordBucketCount(skills[sk], s.createdMs, prPool, null);
           if (s.createdMs > skills[sk].lastUsedMs) skills[sk].lastUsedMs = s.createdMs;
         }
       }
@@ -327,7 +420,7 @@ async function buildConversationProjection(convId, transcriptPath, meta) {
       }
       if (s.commandInfo) {
         const prog = s.commandInfo.program || 'shell';
-        if (!commands[prog]) commands[prog] = { count: 0, failed: 0, lastUsedMs: 0, daily: {} };
+        if (!commands[prog]) commands[prog] = { count: 0, failed: 0, lastUsedMs: 0, daily: {}, buckets: {} };
         commands[prog].count++;
         const cmdDay = commands[prog].daily[s.dateKey] || { count: 0, failed: 0 };
         cmdDay.count++;
@@ -336,6 +429,7 @@ async function buildConversationProjection(convId, transcriptPath, meta) {
           cmdDay.failed++;
         }
         commands[prog].daily[s.dateKey] = cmdDay;
+        recordBucketCount(commands[prog], s.createdMs, lastPool || 'other', Boolean(s.commandInfo.isError));
         if (s.createdMs > commands[prog].lastUsedMs) commands[prog].lastUsedMs = s.createdMs;
       }
       prevStepMs = s.createdMs || prevStepMs;
@@ -444,6 +538,7 @@ async function buildConversationProjection(convId, transcriptPath, meta) {
     ttftDurationMs: effectiveTtftMs,
     ttftSamples: effectiveTtftSamples,
     daily,
+    slices: Object.values(slices),
     skills,
     tools,
     commands,
@@ -570,10 +665,12 @@ export class ProjectionStore {
   }
 
   async getInsights(query = {}) {
-    const convsMap = await this.refresh(Boolean(query.force));
+    const force = Boolean(query.force);
+    const convsMap = await this.refresh(force);
     const allConvs = Object.values(convsMap);
 
-    const range = ['today', '7d', '30d', 'all'].includes(query.range) ? query.range : '30d';
+    const range = ['today', 'weekly_quota', '7d', '30d', 'all'].includes(query.range) ? query.range : '30d';
+    const quotaPool = ['all', 'gemini', 'premium'].includes(query.quotaPool) ? query.quotaPool : 'all';
     const selectedDay = typeof query.day === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(query.day) ? query.day : '';
     const workspaceFilter = typeof query.workspace === 'string' ? query.workspace.trim() : '';
     const searchQ = typeof query.q === 'string' ? query.q.trim().toLowerCase() : '';
@@ -581,6 +678,12 @@ export class ProjectionStore {
     const toolFilter = typeof query.tool === 'string' ? query.tool.trim() : '';
     const cmdFilter = typeof query.cmd === 'string' ? query.cmd.trim() : '';
     const sortBy = ['recent', 'tokens', 'context', 'cost'].includes(query.sort) ? query.sort : 'recent';
+
+    let weeklyQuota = null;
+    if (range === 'weekly_quota') {
+      const quotaSummary = await getUserQuotaSummary({ force });
+      weeklyQuota = resolveWeeklyQuotaWindow(quotaSummary, quotaPool);
+    }
 
     const todayDate = new Date();
     todayDate.setHours(0, 0, 0, 0);
@@ -598,6 +701,17 @@ export class ProjectionStore {
       range === '7d' ? dateKeyDaysAgo(6) :
       range === '30d' ? dateKeyDaysAgo(29) :
       '';
+
+    const isWeeklyMode = range === 'weekly_quota' && !selectedDay && Boolean(weeklyQuota);
+    const inWeeklyWindow = (bucketMs, bucketDurMs, pool) => {
+      if (!weeklyQuota || !(bucketMs > 0)) return false;
+      if (quotaPool !== 'all' && pool !== quotaPool) return false;
+      const win =
+        quotaPool === 'all' && weeklyQuota.hasDistinctResets && weeklyQuota.poolWindows?.[pool]
+          ? weeklyQuota.poolWindows[pool]
+          : weeklyQuota;
+      return bucketMs + bucketDurMs > win.cycleStartMs && bucketMs < win.cycleEndMs;
+    };
 
     // Always compute 7-day chart & 8-week (56-day) heatmap across all conversations (filtered by workspace/search if set)
     const chart7Days = [];
@@ -637,6 +751,19 @@ export class ProjectionStore {
     const windowCount = (entry) => {
       if (!entry) return 0;
       if (range === 'all' && !selectedDay) return entry.count || 0;
+      if (isWeeklyMode) {
+        if (!entry.buckets || typeof entry.buckets !== 'object') return 0;
+        let total = 0;
+        for (const [bKey, value] of Object.entries(entry.buckets)) {
+          const sep = bKey.indexOf('|');
+          if (sep <= 0) continue;
+          const hourMs = Number(bKey.slice(0, sep));
+          const pool = bKey.slice(sep + 1);
+          if (!inWeeklyWindow(hourMs, HOUR_MS, pool)) continue;
+          total += typeof value === 'number' ? value : (value?.count || 0);
+        }
+        return total;
+      }
       if (!entry.daily || typeof entry.daily !== 'object') return 0;
       let total = 0;
       for (const [dk, value] of Object.entries(entry.daily)) {
@@ -649,6 +776,20 @@ export class ProjectionStore {
     const windowFailed = (entry) => {
       if (!entry) return 0;
       if (range === 'all' && !selectedDay) return entry.failed || 0;
+      if (isWeeklyMode) {
+        if (!entry.buckets || typeof entry.buckets !== 'object') return 0;
+        let total = 0;
+        for (const [bKey, value] of Object.entries(entry.buckets)) {
+          const sep = bKey.indexOf('|');
+          if (sep <= 0) continue;
+          const hourMs = Number(bKey.slice(0, sep));
+          const pool = bKey.slice(sep + 1);
+          if (inWeeklyWindow(hourMs, HOUR_MS, pool) && value && typeof value === 'object') {
+            total += value.failed || 0;
+          }
+        }
+        return total;
+      }
       if (!entry.daily || typeof entry.daily !== 'object') return 0;
       let total = 0;
       for (const [dk, value] of Object.entries(entry.daily)) {
@@ -753,6 +894,22 @@ export class ProjectionStore {
         rangeRequests = c.requestsCount;
         rangeTurns = c.turnsCount;
         rangeToolCalls = c.toolCallsCount;
+      } else if (isWeeklyMode) {
+        for (const sl of c.slices || []) {
+          if (inWeeklyWindow(sl.t, SLICE_MS, sl.p)) {
+            hasActivityInWindow = true;
+            rangeBillable += sl.bill || 0;
+            rangeInput += sl.in || 0;
+            rangeCache += sl.cr || 0;
+            rangeCacheEligIn += sl.ceIn || 0;
+            rangeCacheEligRead += sl.ceCr || 0;
+            rangeOutput += sl.out || 0;
+            rangeCost += sl.cost || 0;
+            rangeRequests += sl.req || 0;
+            rangeTurns += sl.turns || 0;
+            rangeToolCalls += sl.tools || 0;
+          }
+        }
       } else {
         for (const [dk, dObj] of Object.entries(c.daily || {})) {
           if (inActiveWindow(dk)) {
@@ -826,7 +983,9 @@ export class ProjectionStore {
       kpi.toolCallsCount += rangeToolCalls;
 
       // Scale billable composition & timing buckets to range ratio
-      const ratio = c.totalBillableTokens > 0 ? rangeBillable / c.totalBillableTokens : 1;
+      const ratio = c.totalBillableTokens > 0
+        ? rangeBillable / c.totalBillableTokens
+        : (rangeRequests > 0 && c.requestsCount > 0 ? rangeRequests / c.requestsCount : 0);
       kpi.activeDurationMs += Math.round((c.activeDurationMs || 0) * ratio);
       kpi.toolDurationMs += Math.round((c.toolDurationMs || 0) * ratio);
       timingAgg.modelMs += Math.round((c.modelDurationMs || 0) * ratio);
@@ -890,6 +1049,8 @@ export class ProjectionStore {
     return {
       generatedAt: Date.now(),
       range,
+      quotaPool: isWeeklyMode && weeklyQuota ? weeklyQuota.selectedPool : 'all',
+      weeklyQuota,
       selectedDay,
       workspaces: [...workspaceSet].sort(),
       kpi,

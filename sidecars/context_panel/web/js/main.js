@@ -21,6 +21,7 @@
     insightsData: null,
     insightsFilters: {
       range: '30d',
+      quotaPool: 'all',
       day: '',
       workspace: '',
       q: '',
@@ -261,6 +262,9 @@
   async function loadInsights(force = false) {
     if (isAuxPane) return;
     const query = Object.assign({}, appState.insightsFilters, force ? { force: 1 } : {});
+    if (query.range !== 'weekly_quota' || query.quotaPool === 'all') {
+      delete query.quotaPool;
+    }
     try {
       const data = await AGY.bridge.apiFetch(`/api/insights${qs(query)}`);
       appState.insightsData = data;
@@ -433,6 +437,9 @@
         onRangeChange: (nextRange) => {
           appState.insightsFilters.range = nextRange;
           appState.insightsFilters.day = '';
+          if (nextRange !== 'weekly_quota') {
+            appState.insightsFilters.quotaPool = 'all';
+          }
           savePrefPatch({ insightsRange: nextRange });
           loadInsights();
         },

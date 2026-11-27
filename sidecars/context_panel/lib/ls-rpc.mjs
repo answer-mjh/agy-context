@@ -9,13 +9,16 @@
 
 import http from 'node:http';
 import https from 'node:https';
+import { parseUserQuotaSummary } from './quota.mjs';
 
 const MAX_RESPONSE_BYTES = 64 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 15_000;
 const DEFAULT_CACHE_TTL_MS = 2_000;
+const QUOTA_CACHE_TTL_MS = 30_000;
 const SERVICE_PATH = '/exa.language_server_pb.LanguageServerService';
 
 const responseCache = new Map();
+let quotaCache = null;
 
 function positiveInt(value, fallback = 0) {
   const n = Number(value);
@@ -74,6 +77,7 @@ export function getLsStatus() {
 
 export function clearLsCache() {
   responseCache.clear();
+  quotaCache = null;
 }
 
 /**
@@ -206,5 +210,39 @@ export async function getGeneratorMetadata(cascadeId, options = {}) {
   } catch {
     if (cached) return cached.value;
     return [];
+  }
+}
+
+/**
+ * Fetch dual-window (5h + weekly) quota summary from RetrieveUserQuotaSummary.
+ * Caches result for 30s and degrades gracefully to null when unavailable.
+ */
+export async function getUserQuotaSummary(options = {}) {
+  if (!getLsConnection()) return null;
+
+  const ttlMs = positiveInt(options.ttlMs, QUOTA_CACHE_TTL_MS);
+  const now = Date.now();
+  if (!options.force && quotaCache && now - quotaCache.at <= ttlMs) {
+    return quotaCache.value;
+  }
+
+  try {
+    const response = await rpcCall('RetrieveUserQuotaSummary', {
+      metadata: {
+        ideName: 'antigravity',
+        extensionName: 'antigravity',
+      },
+    }, {
+      timeoutMs: options.timeoutMs ?? 8_000,
+      signal: options.signal,
+    });
+    const parsed = parseUserQuotaSummary(response);
+    if (parsed) {
+      quotaCache = { at: now, value: parsed };
+    }
+    return parsed;
+  } catch {
+    if (quotaCache) return quotaCache.value;
+    return null;
   }
 }

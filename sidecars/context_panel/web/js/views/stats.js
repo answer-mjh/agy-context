@@ -14,7 +14,7 @@
     const cmdTotal = commands?.summary?.total || 0;
     const p = meta.pricing || {};
     const fam = session.fleet || null;
-    const version = document.body.getAttribute('data-version') || '0.1.0';
+    const version = document.body.getAttribute('data-version') || '0.1.1';
     const isZh = getLang() === 'zh';
 
     const pricingTitle = `${t('pricingHint')}\n${meta.modelLabel || meta.model}\nIn: $${p.inputPerM}/1M · Cache: $${p.cacheReadPerM}/1M · Out: $${p.outputPerM}/1M${p.isFallback ? ' (fallback)' : ''}`;

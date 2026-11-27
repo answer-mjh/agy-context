@@ -2,6 +2,12 @@ import assert from 'node:assert/strict';
 import { createRouter, startStandaloneServer } from '../sidecars/context_panel/lib/router.mjs';
 import { parseDurationMs, parseOfficialContext } from '../sidecars/context_panel/lib/official-context.mjs';
 import { analyzeSession } from '../sidecars/context_panel/lib/session-detail.mjs';
+import {
+  WEEKLY_WINDOW_MS,
+  inferModelQuotaPool,
+  parseUserQuotaSummary,
+  resolveWeeklyQuotaWindow,
+} from '../sidecars/context_panel/lib/quota.mjs';
 
 async function run() {
   // 0. Unit checks for official streamingDuration & TTFT parsing
@@ -138,6 +144,67 @@ async function run() {
   assert.equal(postCompactAnalyzed.stats.tokens.billableTotal, 813500);
   console.log(`[verify] Post-compaction context reset OK: ${postCompactAnalyzed.currentContext.composition.total} tokens`);
 
+  // 0c. Weekly quota parsing & window resolution unit tests
+  assert.equal(inferModelQuotaPool('gemini-4-neon-high'), 'gemini');
+  assert.equal(inferModelQuotaPool('claude-opus-4-6'), 'premium');
+  assert.equal(inferModelQuotaPool('gpt-5.4'), 'premium');
+  assert.equal(inferModelQuotaPool('custom-local-model'), 'other');
+
+  const nowMs = Date.parse('2026-11-27T12:00:00Z');
+  const parsedQuotaSingle = parseUserQuotaSummary({
+    groups: [
+      {
+        displayName: 'Gemini Models',
+        buckets: [
+          { bucketId: 'gemini-5h', window: '5h', remainingFraction: 0.8, resetTime: '2026-11-27T16:00:00Z' },
+          { bucketId: 'gemini-weekly', window: 'weekly', remainingFraction: 0.6, resetTime: '2026-12-02T00:00:00Z' },
+        ],
+      },
+      {
+        displayName: 'Claude and GPT models',
+        buckets: [
+          { bucketId: '3p-5h', remainingFraction: 1, resetTime: '1970-01-01T00:00:00Z' },
+          { bucketId: '3p-weekly', resetTime: '1970-01-01T00:00:00Z' },
+        ],
+      },
+    ],
+  });
+  assert.ok(parsedQuotaSingle && parsedQuotaSingle.groups.length === 2);
+  assert.equal(parsedQuotaSingle.groups[0].pool, 'gemini');
+  assert.equal(parsedQuotaSingle.groups[1].pool, 'premium');
+  assert.equal(parsedQuotaSingle.groups[1].weekly.remainingFraction, 1);
+  assert.equal(parsedQuotaSingle.groups[1].weekly.resetAt, null);
+
+  const winSingle = resolveWeeklyQuotaWindow(parsedQuotaSingle, 'all', nowMs);
+  assert.equal(winSingle.source, 'official');
+  assert.equal(winSingle.hasDistinctResets, false);
+  assert.equal(winSingle.cycleEndMs - winSingle.cycleStartMs, WEEKLY_WINDOW_MS);
+
+  const parsedQuotaDistinct = parseUserQuotaSummary({
+    groups: [
+      {
+        displayName: 'Gemini Models',
+        buckets: [{ bucketId: 'gemini-weekly', window: 'weekly', remainingFraction: 0.4, resetTime: '2026-12-02T00:00:00Z' }],
+      },
+      {
+        displayName: 'Claude and GPT models',
+        buckets: [{ bucketId: '3p-weekly', window: 'weekly', resetTime: '2026-12-03T12:00:00Z' }],
+      },
+    ],
+  });
+  assert.equal(parsedQuotaDistinct.groups[1].weekly.remainingFraction, 0);
+  const winDistinct = resolveWeeklyQuotaWindow(parsedQuotaDistinct, 'all', nowMs);
+  assert.equal(winDistinct.hasDistinctResets, true);
+  assert.ok(winDistinct.poolWindows.gemini && winDistinct.poolWindows.premium);
+  const winPremiumOnly = resolveWeeklyQuotaWindow(parsedQuotaDistinct, 'premium', nowMs);
+  assert.equal(winPremiumOnly.source, 'official');
+  assert.equal(winPremiumOnly.cycleEndMs, Date.parse('2026-12-03T12:00:00Z'));
+
+  const winFallback = resolveWeeklyQuotaWindow(null, 'all', nowMs);
+  assert.equal(winFallback.source, 'fallback_calendar_week');
+  assert.equal(winFallback.cycleEndMs - winFallback.cycleStartMs, WEEKLY_WINDOW_MS);
+  console.log('[verify] Weekly quota parsing & window resolution OK');
+
   const router = createRouter({ version: '0.1.0-test' });
   const server = await startStandaloneServer(router, { port: 0, host: '127.0.0.1' });
 
@@ -198,6 +265,26 @@ async function run() {
     const insightsSum = insights.sessions.reduce((acc, item) => acc + (item.billableTokens || 0), 0);
     assert.equal(insights.kpi.billableTokens, insightsSum, 'insights kpi.billableTokens should equal sum of matching sessions');
     console.log('[verify] Strict isolation & Insights aggregation OK');
+
+    // 3c. Weekly quota Insights endpoints
+    const weeklyAllRes = await fetch(`${server.url}/api/insights?range=weekly_quota`);
+    assert.equal(weeklyAllRes.status, 200);
+    const weeklyAll = await weeklyAllRes.json();
+    assert.equal(weeklyAll.range, 'weekly_quota');
+    assert.ok(weeklyAll.weeklyQuota && weeklyAll.weeklyQuota.cycleStartMs < weeklyAll.weeklyQuota.cycleEndMs);
+    const weeklyAllSum = weeklyAll.sessions.reduce((acc, item) => acc + (item.billableTokens || 0), 0);
+    assert.equal(weeklyAll.kpi.billableTokens, weeklyAllSum, 'weekly_quota kpi.billableTokens should equal sum of matching sessions');
+
+    const weeklyGeminiRes = await fetch(`${server.url}/api/insights?range=weekly_quota&quotaPool=gemini`);
+    assert.equal(weeklyGeminiRes.status, 200);
+    const weeklyGemini = await weeklyGeminiRes.json();
+    assert.equal(weeklyGemini.quotaPool, 'gemini');
+    const weeklyGeminiSum = weeklyGemini.sessions.reduce((acc, item) => acc + (item.billableTokens || 0), 0);
+    assert.equal(weeklyGemini.kpi.billableTokens, weeklyGeminiSum, 'weekly_quota gemini kpi.billableTokens should equal sum of matching sessions');
+    console.log(
+      `[verify] Weekly quota API OK: source=${weeklyAll.weeklyQuota.source}, ` +
+      `allSessions=${weeklyAll.sessions.length}, geminiSessions=${weeklyGemini.sessions.length}`
+    );
 
     // 4. Session overview & step browser endpoints
     if (health.latestSessionId) {
@@ -267,16 +354,24 @@ async function run() {
       );
     }
 
-    // 5. Prefs GET/POST
+    // 5. Prefs GET/POST (including weekly_quota roundtrip without mutating saved pref)
     const prefsGet = await fetch(`${server.url}/api/prefs`);
     assert.equal(prefsGet.status, 200);
     const currentPrefs = await prefsGet.json();
-    const prefsPost = await fetch(`${server.url}/api/prefs`, {
+    const prefsWeeklyPost = await fetch(`${server.url}/api/prefs`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ lang: currentPrefs.lang }),
+      body: JSON.stringify({ insightsRange: 'weekly_quota' }),
     });
-    assert.equal(prefsPost.status, 200);
+    assert.equal(prefsWeeklyPost.status, 200);
+    const prefsWeeklySaved = await prefsWeeklyPost.json();
+    assert.equal(prefsWeeklySaved.insightsRange, 'weekly_quota');
+    const prefsRestore = await fetch(`${server.url}/api/prefs`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ lang: currentPrefs.lang, insightsRange: currentPrefs.insightsRange }),
+    });
+    assert.equal(prefsRestore.status, 200);
     console.log('[verify] Prefs GET/POST OK');
 
     console.log('[verify] ALL BACKEND CHECKS PASSED');

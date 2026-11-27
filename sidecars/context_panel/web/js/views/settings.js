@@ -28,6 +28,7 @@
           <span>${escHtml(t('prefRange'))}</span>
           <select class="select" data-pref="insightsRange">
             <option value="today" ${prefs.insightsRange === 'today' ? 'selected' : ''}>${escHtml(t('rangeToday'))}</option>
+            <option value="weekly_quota" ${prefs.insightsRange === 'weekly_quota' ? 'selected' : ''}>${escHtml(t('rangeWeeklyQuota'))}</option>
             <option value="7d" ${prefs.insightsRange === '7d' ? 'selected' : ''}>${escHtml(t('range7d'))}</option>
             <option value="30d" ${prefs.insightsRange === '30d' ? 'selected' : ''}>${escHtml(t('range30d'))}</option>
             <option value="all" ${prefs.insightsRange === 'all' ? 'selected' : ''}>${escHtml(t('rangeAll'))}</option>

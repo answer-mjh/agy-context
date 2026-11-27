@@ -58,7 +58,7 @@ function normalizeQuery(raw) {
   return out;
 }
 
-export function createRouter({ version = '0.1.0' } = {}) {
+export function createRouter({ version = '0.1.1' } = {}) {
   const projectionStore = new ProjectionStore();
   const detailStore = new SessionDetailStore();
   const fleetStore = new FleetStore(projectionStore, detailStore);
@@ -140,6 +140,8 @@ export function createRouter({ version = '0.1.0' } = {}) {
       kpi: data.kpi,
       sessions: data.sessions.map(s => [s.id, s.lastMs, s.billableTokens]),
       range: data.range,
+      quotaPool: data.quotaPool || 'all',
+      weeklyQuotaReset: data.weeklyQuota?.resetAt || data.weeklyQuota?.cycleEndMs || 0,
       selectedDay: data.selectedDay,
     });
     return {
