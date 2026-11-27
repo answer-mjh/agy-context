@@ -99,6 +99,13 @@
     const totalToolCallsRank = tools.reduce((s, x) => s + (x.count || 0), 0);
     const totalCmdExecs = cmds.reduce((s, x) => s + (x.count || 0), 0);
 
+    const speedLines = [
+      timing.speedSource === 'streaming' ? t('speedTooltipStreaming') : t('speedTooltipEstimated'),
+      timing.avgTtftMs > 0 ? `${t('avgTtftLabel')}: ${fmtDuration(timing.avgTtftMs)}` : '',
+      timing.endToEndTokensPerSec > 0 ? `${t('endToEndSpeedLabel')}: ${timing.endToEndTokensPerSec} tok/s` : '',
+    ].filter(Boolean);
+    const speedTitle = speedLines.join('\n');
+
     const dateSpanLabel = computeRangeLabel(range, filters.day);
 
     container.innerHTML = `
@@ -206,7 +213,7 @@
           <div class="card-header">
             <span class="card-title">◷ ${escHtml(t('timingStatsTitle'))}</span>
             <span class="card-subtitle">${escHtml(t('sessionCumulative'))}</span>
-            <span class="card-subtitle mono">${escHtml(t('outputSpeed'))} ${timing.outputTokensPerSec || 0} tok/s</span>
+            <span class="card-subtitle mono" style="cursor:help" title="${escHtml(speedTitle)}">${escHtml(t('outputSpeed'))} ${timing.outputTokensPerSec || 0} tok/s</span>
           </div>
           <div id="ins-timing-donut"></div>
         </div>

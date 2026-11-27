@@ -179,6 +179,95 @@ function usageOf(chatModel) {
   };
 }
 
+/**
+ * Parse a protobuf Duration field (e.g. "7.574362700s" or { seconds, nanos }) into milliseconds.
+ */
+export function parseDurationMs(value) {
+  if (typeof value === 'number') {
+    return Number.isFinite(value) && value > 0 ? value : 0;
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    const match = trimmed.match(/^(-?\d+(?:\.\d+)?)s$/i);
+    if (match) {
+      const sec = Number(match[1]);
+      return Number.isFinite(sec) && sec > 0 ? sec * 1000 : 0;
+    }
+    return 0;
+  }
+  if (value && typeof value === 'object') {
+    const sec = Number(value.seconds || 0);
+    const nanos = Number(value.nanos || 0);
+    const ms = sec * 1000 + nanos / 1_000_000;
+    return Number.isFinite(ms) && ms > 0 ? ms : 0;
+  }
+  return 0;
+}
+
+/**
+ * Extract per-step and session-total streaming & TTFT timing from generatorMetadata.
+ */
+function extractTimingTelemetry(entries) {
+  const byStep = new Map();
+  let streamingMs = 0;
+  let ttftMs = 0;
+  let totalMs = 0;
+  let outputTokens = 0;
+  let streamingOutputTokens = 0;
+  let samples = 0;
+  let ttftSamples = 0;
+
+  for (const entry of entries) {
+    const chatModel = entry?.chatModel;
+    if (!chatModel || typeof chatModel !== 'object') continue;
+    const stream = parseDurationMs(chatModel.streamingDuration);
+    const ttft = parseDurationMs(chatModel.timeToFirstToken);
+    const total = stream + ttft;
+    if (total <= 0) continue;
+
+    const usage = usageOf(chatModel);
+    const out = usage.outputTokens;
+    const stepIndices = Array.isArray(entry.stepIndices)
+      ? entry.stepIndices.map(toInt).filter(idx => idx >= 0)
+      : [];
+
+    const record = {
+      streamingMs: Math.round(stream),
+      ttftMs: Math.round(ttft),
+      totalMs: Math.round(total),
+      outputTokens: out,
+    };
+    for (const idx of stepIndices) {
+      byStep.set(idx, record);
+    }
+
+    totalMs += total;
+    outputTokens += out;
+    if (ttft > 0) {
+      ttftMs += ttft;
+      ttftSamples++;
+    }
+    if (stream > 0 && out > 0) {
+      streamingMs += stream;
+      streamingOutputTokens += out;
+      samples++;
+    }
+  }
+
+  return {
+    byStep,
+    totals: {
+      streamingMs: Math.round(streamingMs),
+      ttftMs: Math.round(ttftMs),
+      totalMs: Math.round(totalMs),
+      outputTokens,
+      streamingOutputTokens,
+      samples,
+      ttftSamples,
+    },
+  };
+}
+
 function checkpointIndexOf(chatModel) {
   const value = chatModel?.chatStartMetadata?.checkpointIndex;
   return toInt(value);
@@ -548,6 +637,7 @@ export function parseOfficialContext(generatorMetadata, options = {}) {
     latestStepIndices,
     checkpointIndex: checkpointIndexOf(chatModel),
     checkpoints: detectCheckpoints(entries),
+    timing: extractTimingTelemetry(entries),
     buckets,
     fixed,
     chat,

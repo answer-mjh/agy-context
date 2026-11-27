@@ -93,7 +93,7 @@ function getTranscriptPaths(convId) {
 /**
  * Build full L3 session analytics from parsed transcript steps.
  */
-function analyzeSession(convId, parsed, meta, official = null) {
+export function analyzeSession(convId, parsed, meta, official = null) {
   const steps = parsed.steps || [];
   const plannerSnapshots = [];
   const events = [];
@@ -142,11 +142,17 @@ function analyzeSession(convId, parsed, meta, official = null) {
   let userInputsCount = 0;
   let totalToolDurationMs = 0;
   let totalModelDurationMs = 0;
+  let totalStreamingMs = 0;
+  let totalStreamingOutputTokens = 0;
+  let totalTtftMs = 0;
+  let ttftSamples = 0;
   let totalOverheadMs = 0;
   let checkpointCount = 0;
+  let lastCheckpointStepIndex = -1;
   let firstMs = 0;
   let lastMs = 0;
   let prevStepMs = 0;
+  let prevStepType = '';
   let latestModel = '';
   let prevPromptTokens = 0;
   let prevComp = null;
@@ -239,6 +245,7 @@ function analyzeSession(convId, parsed, meta, official = null) {
 
       pendingInItems.push({ kind: 'user', label: truncate(s.cleanText, 80) });
       prevStepMs = s.createdMs || prevStepMs;
+      prevStepType = s.type;
       continue;
     }
 
@@ -274,11 +281,13 @@ function analyzeSession(convId, parsed, meta, official = null) {
         label: truncate(s.error || s.content, 72),
       });
       prevStepMs = s.createdMs || prevStepMs;
+      prevStepType = s.type;
       continue;
     }
 
     if (s.type === 'CHECKPOINT') {
       checkpointCount++;
+      lastCheckpointStepIndex = Math.max(lastCheckpointStepIndex, s.stepIndex);
       if (s.model) latestModel = s.model;
       totalInputTokens += s.inputTokens;
       totalCacheReadTokens += s.cacheReadTokens;
@@ -331,6 +340,7 @@ function analyzeSession(convId, parsed, meta, official = null) {
 
       pendingInItems.push({ kind: 'system', label: 'Context compaction' });
       prevStepMs = s.createdMs || prevStepMs;
+      prevStepType = s.type;
       continue;
     }
 
@@ -345,15 +355,44 @@ function analyzeSession(convId, parsed, meta, official = null) {
       totalCost += s.cost;
       totalToolCalls += (s.toolCalls || []).length;
 
-      // Estimate model response duration using next step timestamp
+      // Prefer official streamingDuration + timeToFirstToken from language server.
+      // When unavailable (e.g. standalone), estimate from next runtime step ONLY
+      // — never include human reading/typing time before the next USER_INPUT.
       let modelDurMs = 0;
-      const nextStep = steps[i + 1];
-      if (nextStep && nextStep.createdMs > s.createdMs && nextStep.createdMs - s.createdMs < 300_000) {
-        modelDurMs = nextStep.createdMs - s.createdMs;
-      } else if (prevStepMs > 0 && s.createdMs > prevStepMs && s.createdMs - prevStepMs < 120_000) {
-        modelDurMs = s.createdMs - prevStepMs;
+      let stepStreamingMs = 0;
+      let stepTtftMs = 0;
+      const officialTiming = official?.timing?.byStep?.get(s.stepIndex) || null;
+      if (officialTiming && officialTiming.totalMs > 0) {
+        modelDurMs = officialTiming.totalMs;
+        stepStreamingMs = officialTiming.streamingMs;
+        stepTtftMs = officialTiming.ttftMs;
+      } else {
+        const nextStep = steps[i + 1];
+        if (
+          nextStep &&
+          nextStep.type !== 'USER_INPUT' &&
+          nextStep.createdMs > s.createdMs &&
+          nextStep.createdMs - s.createdMs < 180_000
+        ) {
+          modelDurMs = nextStep.createdMs - s.createdMs;
+        } else if (
+          prevStepMs > 0 &&
+          (prevStepType === 'USER_INPUT' || prevStepType === 'GENERIC') &&
+          s.createdMs > prevStepMs &&
+          s.createdMs - prevStepMs < 60_000
+        ) {
+          modelDurMs = s.createdMs - prevStepMs;
+        }
       }
       totalModelDurationMs += modelDurMs;
+      if (stepStreamingMs > 0 && s.outputTokens > 0) {
+        totalStreamingMs += stepStreamingMs;
+        totalStreamingOutputTokens += s.outputTokens;
+      }
+      if (stepTtftMs > 0) {
+        totalTtftMs += stepTtftMs;
+        ttftSamples++;
+      }
 
       // Detect compaction (significant prompt token drop)
       const flags = [];
@@ -499,6 +538,11 @@ function analyzeSession(convId, parsed, meta, official = null) {
         contextWindow: s.contextWindow,
         maxOutput: s.maxOutput,
         durationMs: modelDurMs,
+        streamingMs: stepStreamingMs,
+        ttftMs: stepTtftMs,
+        tokensPerSec: stepStreamingMs > 0 && s.outputTokens > 0
+          ? Math.round(s.outputTokens / (stepStreamingMs / 1000))
+          : (modelDurMs > 0 && s.outputTokens > 0 ? Math.round(s.outputTokens / (modelDurMs / 1000)) : 0),
         actual: {
           inputTokens: s.inputTokens,
           cacheReadTokens: s.cacheReadTokens,
@@ -527,6 +571,7 @@ function analyzeSession(convId, parsed, meta, official = null) {
       prevPromptTokens = s.totalPromptTokens > 0 ? s.totalPromptTokens : prevPromptTokens;
       prevComp = composition;
       prevStepMs = s.createdMs || prevStepMs;
+      prevStepType = s.type;
       continue;
     }
 
@@ -655,6 +700,7 @@ function analyzeSession(convId, parsed, meta, official = null) {
       }
 
       prevStepMs = s.createdMs || prevStepMs;
+      prevStepType = s.type;
     }
   }
 
@@ -765,7 +811,17 @@ function analyzeSession(convId, parsed, meta, official = null) {
     totalModelDurationMs + totalToolDurationMs + overheadMs > 0
       ? totalModelDurationMs + totalToolDurationMs + overheadMs
       : totalSpanMs;
-  const outputTokensPerSec = totalModelDurationMs > 0 ? Math.round(totalOutputTokens / (totalModelDurationMs / 1000)) : 0;
+  const officialTotals = official?.timing?.totals || null;
+  const effectiveStreamMs = totalStreamingMs > 0 ? totalStreamingMs : (officialTotals?.streamingMs || 0);
+  const effectiveStreamOut = totalStreamingMs > 0 ? totalStreamingOutputTokens : (officialTotals?.streamingOutputTokens || 0);
+  const effectiveTtftMs = ttftSamples > 0 ? totalTtftMs : (officialTotals?.ttftMs || 0);
+  const effectiveTtftSamples = ttftSamples > 0 ? ttftSamples : (officialTotals?.ttftSamples || 0);
+  const endToEndTokensPerSec = totalModelDurationMs > 0 ? Math.round(totalOutputTokens / (totalModelDurationMs / 1000)) : 0;
+  const outputTokensPerSec = effectiveStreamMs > 0 && effectiveStreamOut > 0
+    ? Math.round(effectiveStreamOut / (effectiveStreamMs / 1000))
+    : endToEndTokensPerSec;
+  const avgTtftMs = effectiveTtftSamples > 0 ? Math.round(effectiveTtftMs / effectiveTtftSamples) : 0;
+  const speedSource = effectiveStreamMs > 0 && effectiveStreamOut > 0 ? 'streaming' : 'estimated';
 
   const toolCountMap = new Map();
   for (const sn of plannerSnapshots) {
@@ -837,46 +893,81 @@ function analyzeSession(convId, parsed, meta, official = null) {
       latestSnap.delta.media = (latestSnap.delta.media || 0) + moved;
     }
   }
+  const compactedAfterLatestPlanner = lastCheckpointStepIndex > lastPlannerStepIndex;
   const firstUserItem = historyItems.find(h => h.kind === 'user');
   const effectiveWindow = official?.maxContextTokens || latestSnap?.contextWindow || spec.contextWindow;
   const nativeWindow = Math.max(official?.nativeContextWindow || 0, spec.contextWindow, effectiveWindow);
-  const currentComposition = latestSnap?.composition
-    || {
-      systemBase: 0,
-      toolDefs: 0,
-      user: 0,
-      injected: 0,
-      skills: 0,
-      assistant: 0,
+  let currentComposition;
+  let currentUsedTokens;
+  let currentActual;
+
+  if (compactedAfterLatestPlanner) {
+    const postCompactBarCum = {
+      ...cum,
+      assistant: cum.assistant + cum.thinking + cum.toolCall,
       thinking: 0,
-      tools: 0,
-      media: 0,
-      other: 0,
-      total: 0,
+      tools: cum.toolResult,
     };
-  const currentUsedTokens = official?.usedTokens || currentComposition.total || 0;
-  const officialUsage = official?.usage;
-  const currentActual = officialUsage && officialUsage.totalPromptTokens > 0
-    ? {
-        inputTokens: officialUsage.inputTokens,
-        cacheReadTokens: officialUsage.cacheReadTokens,
-        outputTokens: officialUsage.outputTokens,
-        totalPromptTokens: officialUsage.totalPromptTokens,
-        totalBillableTokens: officialUsage.totalBillableTokens,
-        cacheHitRate: officialUsage.totalPromptTokens > 0
-          ? officialUsage.cacheReadTokens / officialUsage.totalPromptTokens
-          : 0,
-        cost: latestSnap?.actual.cost || 0,
-      }
-    : (latestSnap?.actual || {
-        inputTokens: 0,
-        cacheReadTokens: 0,
-        outputTokens: 0,
-        totalPromptTokens: 0,
-        totalBillableTokens: 0,
-        cacheHitRate: 0,
-        cost: 0,
-      });
+    const postCompactVisSum =
+      postCompactBarCum.user +
+      postCompactBarCum.injected +
+      postCompactBarCum.skills +
+      postCompactBarCum.assistant +
+      postCompactBarCum.tools +
+      postCompactBarCum.media +
+      postCompactBarCum.other;
+    const baseForPostCompact = officialFixedTotal > 0 ? officialFixedTotal : (latestSnap?.estimatedBaseTokens || 0);
+    const postCompactTotal = baseForPostCompact + postCompactVisSum;
+    currentComposition = estimateComposition(postCompactBarCum, postCompactTotal, official).composition;
+    currentUsedTokens = currentComposition.total;
+    currentActual = {
+      inputTokens: currentUsedTokens,
+      cacheReadTokens: 0,
+      outputTokens: 0,
+      totalPromptTokens: currentUsedTokens,
+      totalBillableTokens: currentUsedTokens,
+      cacheHitRate: 0,
+      cost: 0,
+    };
+  } else {
+    currentComposition = latestSnap?.composition
+      || {
+        systemBase: 0,
+        toolDefs: 0,
+        user: 0,
+        injected: 0,
+        skills: 0,
+        assistant: 0,
+        thinking: 0,
+        tools: 0,
+        media: 0,
+        other: 0,
+        total: 0,
+      };
+    currentUsedTokens = official?.usedTokens || currentComposition.total || 0;
+    const officialUsage = official?.usage;
+    currentActual = officialUsage && officialUsage.totalPromptTokens > 0
+      ? {
+          inputTokens: officialUsage.inputTokens,
+          cacheReadTokens: officialUsage.cacheReadTokens,
+          outputTokens: officialUsage.outputTokens,
+          totalPromptTokens: officialUsage.totalPromptTokens,
+          totalBillableTokens: officialUsage.totalBillableTokens,
+          cacheHitRate: officialUsage.totalPromptTokens > 0
+            ? officialUsage.cacheReadTokens / officialUsage.totalPromptTokens
+            : 0,
+          cost: latestSnap?.actual.cost || 0,
+        }
+      : (latestSnap?.actual || {
+          inputTokens: 0,
+          cacheReadTokens: 0,
+          outputTokens: 0,
+          totalPromptTokens: 0,
+          totalBillableTokens: 0,
+          cacheHitRate: 0,
+          cost: 0,
+        });
+  }
 
   return {
     id: convId,
@@ -931,7 +1022,12 @@ function analyzeSession(convId, parsed, meta, official = null) {
         toolMs: totalToolDurationMs,
         overheadMs,
         totalActiveMs,
+        streamingMs: effectiveStreamMs,
+        ttftMs: effectiveTtftMs,
+        avgTtftMs,
         outputTokensPerSec,
+        endToEndTokensPerSec,
+        speedSource,
       },
     },
     currentContext: {
@@ -979,6 +1075,8 @@ function analyzeSession(convId, parsed, meta, official = null) {
     // Kept internal for getStepBrowser(); getOverview() intentionally does not
     // serialize the full prompt sections and tool schemas on every poll.
     _officialFull: official,
+    _compactedAfterLatestPlanner: compactedAfterLatestPlanner,
+    _latestHistoryEpoch: historyEpoch,
   };
 }
 
@@ -1090,7 +1188,8 @@ export class SessionDetailStore {
     this.lru = new Map(); // convId -> analyzed session
   }
 
-  async load(convId, meta) {
+  async load(convId, meta, options = {}) {
+    const force = Boolean(options?.force);
     const { path: filePath, isFull } = getTranscriptPaths(convId);
     if (!filePath) return null;
 
@@ -1102,7 +1201,7 @@ export class SessionDetailStore {
     }
 
     const cached = this.lru.get(convId);
-    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+    if (!force && cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
       // Refresh LRU recency
       this.lru.delete(convId);
       this.lru.set(convId, cached);
@@ -1113,7 +1212,7 @@ export class SessionDetailStore {
     if (!parsed) return null;
     parsed.isFull = isFull;
 
-    const officialRaw = await getGeneratorMetadata(convId);
+    const officialRaw = await getGeneratorMetadata(convId, { force });
     const transcriptModel = [...parsed.steps].reverse()
       .find(step => step.type === 'PLANNER_RESPONSE' && step.model)?.model || '';
     const official = parseOfficialContext(officialRaw, { modelId: transcriptModel });
@@ -1129,8 +1228,8 @@ export class SessionDetailStore {
     return analyzed;
   }
 
-  async getOverview(convId, meta, selectedSeq = -1) {
-    const session = await this.load(convId, meta);
+  async getOverview(convId, meta, selectedSeq = -1, options = {}) {
+    const session = await this.load(convId, meta, options);
     if (!session) return null;
 
     const steps = session.timeline.steps;
@@ -1156,6 +1255,9 @@ export class SessionDetailStore {
           modelLabel: s.modelLabel,
           contextWindow: s.contextWindow,
           durationMs: s.durationMs,
+          streamingMs: s.streamingMs || 0,
+          ttftMs: s.ttftMs || 0,
+          tokensPerSec: s.tokensPerSec || 0,
           actual: s.actual,
           composition: s.composition,
           delta: s.delta,
@@ -1170,8 +1272,8 @@ export class SessionDetailStore {
     };
   }
 
-  async getStepBrowser(convId, meta, seqParam = -1, baseline = 'prev_turn') {
-    const session = await this.load(convId, meta);
+  async getStepBrowser(convId, meta, seqParam = -1, baseline = 'prev_turn', options = {}) {
+    const session = await this.load(convId, meta, options);
     if (!session) return null;
 
     const steps = session.timeline.steps;
@@ -1180,19 +1282,26 @@ export class SessionDetailStore {
     const snap = targetSeq >= 0 ? steps[targetSeq] : null;
     const officialFull = isLatest ? session._officialFull : null;
     const hasOfficialFixed = Boolean(officialFull?.hasBreakdown);
+    const isPostCompactLatest = isLatest && Boolean(session._compactedAfterLatestPlanner);
 
     // Only show items belonging to the snapshot's history epoch. A compaction
     // starts a new epoch, so pre-compaction items stay viewable on old steps
     // but never leak into the current context view.
-    const targetEpoch = snap ? (snap.historyEpoch ?? 0) : 0;
-    const cutoff = snap ? snap.historyCountBefore : session.historyItems.length;
+    const targetEpoch = isPostCompactLatest
+      ? (session._latestHistoryEpoch ?? 0)
+      : (snap ? (snap.historyEpoch ?? 0) : 0);
+    const cutoff = isPostCompactLatest
+      ? session.historyItems.length
+      : (snap ? snap.historyCountBefore : session.historyItems.length);
     const items = session.historyItems
       .slice(0, cutoff)
       .filter(item => (item.epoch ?? 0) === targetEpoch);
 
     // Find baseline snapshot for diff badges (`vs previous turn` or `vs previous step`)
     let baseSeq = -1;
-    if (snap && targetSeq > 0) {
+    if (isPostCompactLatest) {
+      baseSeq = targetSeq;
+    } else if (snap && targetSeq > 0) {
       if (baseline === 'prev_step') {
         baseSeq = targetSeq - 1;
       } else {

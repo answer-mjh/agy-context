@@ -163,6 +163,10 @@ export function createRouter({ version = '0.1.0' } = {}) {
 
   async function handleSession(rawQuery) {
     const q = normalizeQuery(rawQuery);
+    const force = q.force === '1' || q.force === 'true';
+    if (force) {
+      await projectionStore.refresh(true);
+    }
     const sessions = await projectionStore.listSessions();
     const sessionOptions = mapSessionOptions(sessions);
     const convId = (q.id || '').trim();
@@ -176,13 +180,14 @@ export function createRouter({ version = '0.1.0' } = {}) {
           fleet: null,
           session: null,
         },
+        headers: { 'Cache-Control': 'no-cache' },
       };
     }
 
     const meta = sessions.find(s => s.id === convId) || null;
     const stepSeq = q.step !== undefined && q.step !== '' ? Number(q.step) : -1;
     const [overview, fleetSummary] = await Promise.all([
-      detailStore.getOverview(convId, meta, Number.isFinite(stepSeq) ? stepSeq : -1),
+      detailStore.getOverview(convId, meta, Number.isFinite(stepSeq) ? stepSeq : -1, { force }),
       fleetStore.getSummary(convId).catch(() => null),
     ]);
 
@@ -197,6 +202,7 @@ export function createRouter({ version = '0.1.0' } = {}) {
           fleet: null,
           session: null,
         },
+        headers: { 'Cache-Control': 'no-cache' },
       };
     }
 
@@ -208,11 +214,16 @@ export function createRouter({ version = '0.1.0' } = {}) {
         fleet: fleetSummary,
         session: overview,
       },
+      headers: { 'Cache-Control': 'no-cache' },
     };
   }
 
   async function handleFleet(rawQuery) {
     const q = normalizeQuery(rawQuery);
+    const force = q.force === '1' || q.force === 'true';
+    if (force) {
+      await projectionStore.refresh(true);
+    }
     const sessions = await projectionStore.listSessions();
     const sessionOptions = mapSessionOptions(sessions);
     const convId = (q.id || '').trim();
@@ -229,6 +240,7 @@ export function createRouter({ version = '0.1.0' } = {}) {
           timeline: [],
           summary: null,
         },
+        headers: { 'Cache-Control': 'no-cache' },
       };
     }
     const data = await fleetStore.getFleet(convId);
@@ -246,6 +258,7 @@ export function createRouter({ version = '0.1.0' } = {}) {
           timeline: [],
           summary: null,
         },
+        headers: { 'Cache-Control': 'no-cache' },
       };
     }
     return {
@@ -255,24 +268,34 @@ export function createRouter({ version = '0.1.0' } = {}) {
         sessions: sessionOptions,
         ...data,
       },
+      headers: { 'Cache-Control': 'no-cache' },
     };
   }
 
   async function handleStep(rawQuery) {
     const q = normalizeQuery(rawQuery);
+    const force = q.force === '1' || q.force === 'true';
     const convId = (q.id || '').trim();
     if (!convId) {
-      return { status: 200, body: { empty: true, reason: 'missing_conversation_id', categories: [], dna: { ribbon: [], list: [], totalTokens: 0 } } };
+      return {
+        status: 200,
+        body: { empty: true, reason: 'missing_conversation_id', categories: [], dna: { ribbon: [], list: [], totalTokens: 0 } },
+        headers: { 'Cache-Control': 'no-cache' },
+      };
     }
     const sessions = await projectionStore.listSessions();
     const meta = sessions.find(s => s.id === convId) || null;
     const seq = q.step !== undefined && q.step !== '' ? Number(q.step) : -1;
     const baseline = q.baseline === 'prev_step' ? 'prev_step' : 'prev_turn';
-    const data = await detailStore.getStepBrowser(convId, meta, Number.isFinite(seq) ? seq : -1, baseline);
+    const data = await detailStore.getStepBrowser(convId, meta, Number.isFinite(seq) ? seq : -1, baseline, { force });
     if (!data) {
-      return { status: 200, body: { empty: true, reason: 'no_transcript_yet', id: convId, categories: [], dna: { ribbon: [], list: [], totalTokens: 0 } } };
+      return {
+        status: 200,
+        body: { empty: true, reason: 'no_transcript_yet', id: convId, categories: [], dna: { ribbon: [], list: [], totalTokens: 0 } },
+        headers: { 'Cache-Control': 'no-cache' },
+      };
     }
-    return { status: 200, body: data };
+    return { status: 200, body: data, headers: { 'Cache-Control': 'no-cache' } };
   }
 
   function handleAttachment(rawQuery) {
@@ -377,21 +400,21 @@ export async function startStandaloneServer(router, { port = 17846, host = '127.
 
       if (pathname === '/api/session') {
         const out = await router.handleSession(query);
-        res.writeHead(out.status, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.writeHead(out.status, { 'Content-Type': 'application/json; charset=utf-8', ...(out.headers || {}) });
         res.end(JSON.stringify(out.body));
         return;
       }
 
       if (pathname === '/api/fleet') {
         const out = await router.handleFleet(query);
-        res.writeHead(out.status, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.writeHead(out.status, { 'Content-Type': 'application/json; charset=utf-8', ...(out.headers || {}) });
         res.end(JSON.stringify(out.body));
         return;
       }
 
       if (pathname === '/api/step') {
         const out = await router.handleStep(query);
-        res.writeHead(out.status, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.writeHead(out.status, { 'Content-Type': 'application/json; charset=utf-8', ...(out.headers || {}) });
         res.end(JSON.stringify(out.body));
         return;
       }

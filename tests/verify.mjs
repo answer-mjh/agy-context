@@ -1,7 +1,126 @@
 import assert from 'node:assert/strict';
 import { createRouter, startStandaloneServer } from '../sidecars/context_panel/lib/router.mjs';
+import { parseDurationMs, parseOfficialContext } from '../sidecars/context_panel/lib/official-context.mjs';
+import { analyzeSession } from '../sidecars/context_panel/lib/session-detail.mjs';
 
 async function run() {
+  // 0. Unit checks for official streamingDuration & TTFT parsing
+  assert.ok(Math.abs(parseDurationMs('7.574362700s') - 7574.3627) < 0.01);
+  assert.equal(parseDurationMs({ seconds: 2, nanos: 500_000_000 }), 2500);
+  assert.equal(parseDurationMs('-1s'), 0);
+  const parsedTiming = parseOfficialContext([
+    {
+      stepIndices: [1],
+      chatModel: {
+        model: 'MODEL_PLACEHOLDER_M532',
+        streamingDuration: '7.574362700s',
+        timeToFirstToken: '10.668614500s',
+        usage: { inputTokens: '3597', cacheReadTokens: '392366', outputTokens: '1310' },
+      },
+    },
+  ]);
+  assert.ok(parsedTiming?.timing?.byStep?.get(1));
+  assert.equal(parsedTiming.timing.totals.streamingOutputTokens, 1310);
+  assert.equal(
+    Math.round(parsedTiming.timing.totals.streamingOutputTokens / (parsedTiming.timing.totals.streamingMs / 1000)),
+    173
+  );
+  console.log('[verify] Official streamingDuration/TTFT parsing OK');
+
+  // 0b. Post-compaction context drop unit test (CHECKPOINT after latest PLANNER_RESPONSE)
+  const staleOfficial = parseOfficialContext([
+    {
+      stepIndices: [2],
+      chatModel: {
+        model: 'MODEL_PLACEHOLDER_M532',
+        usage: { inputTokens: '10000', cacheReadTokens: '390000', outputTokens: '500' },
+        chatStartMetadata: {
+          contextWindowMetadata: {
+            estimatedTokensUsed: 400000,
+            maxContextTokens: 512000,
+            tokenBreakdown: {
+              groups: [
+                { type: 'TOKEN_TYPE_SYSTEM_PROMPT', numTokens: 15000 },
+                { type: 'TOKEN_TYPE_CHAT_MESSAGES', numTokens: 385000 },
+              ],
+            },
+          },
+        },
+      },
+    },
+  ]);
+  const postCompactAnalyzed = analyzeSession(
+    'post-compact-test',
+    {
+      mtimeMs: Date.now(),
+      size: 1234,
+      isFull: true,
+      steps: [
+        {
+          stepIndex: 1,
+          turnIndex: 1,
+          type: 'USER_INPUT',
+          createdAt: '2026-11-27T04:00:00Z',
+          createdMs: 1700000000000,
+          cleanText: 'hi',
+          rawText: 'hi',
+          tokensEst: 100,
+          mediaTokensEst: 0,
+        },
+        {
+          stepIndex: 2,
+          turnIndex: 1,
+          type: 'PLANNER_RESPONSE',
+          createdAt: '2026-11-27T04:00:05Z',
+          createdMs: 1700000005000,
+          model: 'gemini-4-neon-high',
+          modelLabel: 'Gemini',
+          contextWindow: 512000,
+          maxOutput: 65536,
+          inputTokens: 10000,
+          cacheReadTokens: 390000,
+          outputTokens: 500,
+          totalPromptTokens: 400000,
+          totalBillableTokens: 400500,
+          cost: 0.1,
+          thinkingTokensEst: 100,
+          answerTokensEst: 400,
+          toolCallTokensEst: 0,
+          toolCalls: [],
+        },
+        {
+          stepIndex: 3,
+          turnIndex: 1,
+          type: 'CHECKPOINT',
+          createdAt: '2026-11-27T04:01:00Z',
+          createdMs: 1700000060000,
+          tokensEst: 5800,
+          inputTokens: 410000,
+          cacheReadTokens: 0,
+          outputTokens: 3000,
+          totalPromptTokens: 410000,
+          totalBillableTokens: 413000,
+          cost: 0.2,
+          content: 'Summary',
+        },
+      ],
+    },
+    { title: 'compact-test' },
+    staleOfficial
+  );
+  assert.equal(postCompactAnalyzed._compactedAfterLatestPlanner, true);
+  assert.ok(
+    postCompactAnalyzed.currentContext.composition.total > 0 &&
+    postCompactAnalyzed.currentContext.composition.total <= 25000,
+    `Expected post-compact context <= 25000, got ${postCompactAnalyzed.currentContext.composition.total}`
+  );
+  assert.ok(postCompactAnalyzed.currentContext.usagePct < 10);
+  assert.equal(
+    postCompactAnalyzed.currentContext.actual.totalPromptTokens,
+    postCompactAnalyzed.currentContext.composition.total
+  );
+  console.log(`[verify] Post-compaction context reset OK: ${postCompactAnalyzed.currentContext.composition.total} tokens`);
+
   const router = createRouter({ version: '0.1.0-test' });
   const server = await startStandaloneServer(router, { port: 0, host: '127.0.0.1' });
 
@@ -24,11 +143,12 @@ async function run() {
     assert.ok(Array.isArray(insights.chart7Days) && insights.chart7Days.length === 7);
     assert.ok(Array.isArray(insights.heatmap56) && insights.heatmap56.length === 56);
     assert.ok(Array.isArray(insights.sessions));
+    assert.ok(Number.isFinite(insights.timing?.outputTokensPerSec) && insights.timing.outputTokensPerSec >= 0);
     console.log(
       `[verify] Insights OK (${elapsed1}ms): sessions=${insights.sessions.length}, ` +
       `billable=${insights.kpi.billableTokens}, cacheHit=${(insights.kpi.cacheHitRate * 100).toFixed(1)}%, ` +
-      `cost=$${insights.kpi.cost.toFixed(4)}, skills=${insights.rankings.skills.length}, ` +
-      `tools=${insights.rankings.tools.length}, cmds=${insights.rankings.commands.length}`
+      `cost=$${insights.kpi.cost.toFixed(4)}, speed=${insights.timing.outputTokensPerSec} tok/s (${insights.timing.speedSource}), ` +
+      `skills=${insights.rankings.skills.length}, tools=${insights.rankings.tools.length}, cmds=${insights.rankings.commands.length}`
     );
 
     // 3. Cached second call speed check
@@ -66,14 +186,22 @@ async function run() {
     if (health.latestSessionId) {
       const sessRes = await fetch(`${server.url}/api/session?id=${encodeURIComponent(health.latestSessionId)}`);
       assert.equal(sessRes.status, 200);
+      assert.match(String(sessRes.headers.get('cache-control') || ''), /no-cache/i);
+      const sessForceRes = await fetch(`${server.url}/api/session?id=${encodeURIComponent(health.latestSessionId)}&force=1`);
+      assert.equal(sessForceRes.status, 200);
+      assert.match(String(sessForceRes.headers.get('cache-control') || ''), /no-cache/i);
+      await sessForceRes.json();
       const sessPayload = await sessRes.json();
       assert.equal(sessPayload.empty, false);
       assert.ok(sessPayload.session);
       assert.equal(sessPayload.session.id, health.latestSessionId);
       const s = sessPayload.session;
+      assert.ok(Number.isFinite(s.stats?.timing?.outputTokensPerSec) && s.stats.timing.outputTokensPerSec >= 0);
+      assert.ok(['streaming', 'estimated'].includes(s.stats?.timing?.speedSource));
       console.log(
         `[verify] Session OK: title="${s.meta.title}", model=${s.meta.model}, ` +
         `requests=${s.timeline.steps.length}, turns=${s.timeline.turns.length}, ` +
+        `speed=${s.stats.timing.outputTokensPerSec} tok/s (${s.stats.timing.speedSource}), ` +
         `events=${s.events.length}, files=${s.fileActivity.totalFiles}, cmds=${s.commands.summary.total}`
       );
       if (insights.sessions.length >= 2) {

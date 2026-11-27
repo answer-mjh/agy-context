@@ -9,10 +9,11 @@ import {
   estimateComposition,
   normalizeOutputRatios,
   officialCompositionWithSplit,
+  officialFixedTotals,
   parseOfficialContext,
 } from './official-context.mjs';
 
-const CACHE_VERSION = 7;
+const CACHE_VERSION = 9;
 
 function getCachePath() {
   const live = Boolean(process.env.ANTIGRAVITY_LS_ADDRESS && process.env.ANTIGRAVITY_CSRF_TOKEN);
@@ -62,6 +63,10 @@ async function buildConversationProjection(convId, transcriptPath, meta) {
   let totalToolCalls = 0;
   let totalToolDurationMs = 0;
   let totalModelDurationMs = 0;
+  let totalStreamingMs = 0;
+  let totalStreamingOutputTokens = 0;
+  let totalTtftMs = 0;
+  let ttftSamples = 0;
   let totalOverheadMs = 0;
   let turnsCount = 0;
   let firstUserTitle = '';
@@ -69,9 +74,12 @@ async function buildConversationProjection(convId, transcriptPath, meta) {
   let latestModel = '';
   let latestWindow = 0;
   let prevStepMs = 0;
+  let prevStepType = '';
   let responseThinkingEst = 0;
   let responseAnswerEst = 0;
   let responseToolEst = 0;
+  let lastPlannerStepIndex = -1;
+  let lastCheckpointStepIndex = -1;
 
   // Track cumulative billable category weights for Insights donut
   const billableBuckets = {
@@ -130,16 +138,19 @@ async function buildConversationProjection(convId, transcriptPath, meta) {
         }
       }
       prevStepMs = s.createdMs || prevStepMs;
+      prevStepType = s.type;
       continue;
     }
 
     if (s.type === 'SYSTEM_MESSAGE' || s.type === 'ERROR_MESSAGE') {
       cum.injected += s.tokensEst || 0;
       prevStepMs = s.createdMs || prevStepMs;
+      prevStepType = s.type;
       continue;
     }
 
     if (s.type === 'CHECKPOINT') {
+      lastCheckpointStepIndex = Math.max(lastCheckpointStepIndex, s.stepIndex);
       totalRequests++;
       if (s.model) {
         models.add(s.model);
@@ -168,10 +179,12 @@ async function buildConversationProjection(convId, transcriptPath, meta) {
       billableBuckets.injected += s.totalPromptTokens;
       billableBuckets.assistant += s.outputTokens;
       prevStepMs = s.createdMs || prevStepMs;
+      prevStepType = s.type;
       continue;
     }
 
     if (s.type === 'PLANNER_RESPONSE') {
+      lastPlannerStepIndex = Math.max(lastPlannerStepIndex, s.stepIndex);
       totalRequests++;
       if (s.model) {
         models.add(s.model);
@@ -187,14 +200,45 @@ async function buildConversationProjection(convId, transcriptPath, meta) {
         latestPromptTokens = s.totalPromptTokens;
       }
 
-      // Estimate model latency from gap to next step (matching session-detail.mjs)
-      const nextStep = parsed.steps[idx + 1];
-      if (nextStep && nextStep.createdMs > s.createdMs && nextStep.createdMs - s.createdMs < 300_000) {
-        totalModelDurationMs += nextStep.createdMs - s.createdMs;
-      } else if (prevStepMs > 0 && s.createdMs > prevStepMs && s.createdMs - prevStepMs < 120_000) {
-        totalModelDurationMs += s.createdMs - prevStepMs;
+      // Prefer official streamingDuration + timeToFirstToken from language server.
+      // When unavailable, estimate from next runtime step ONLY (never human idle before USER_INPUT).
+      let modelDurMs = 0;
+      let stepStreamingMs = 0;
+      let stepTtftMs = 0;
+      const officialTiming = official?.timing?.byStep?.get(s.stepIndex) || null;
+      if (officialTiming && officialTiming.totalMs > 0) {
+        modelDurMs = officialTiming.totalMs;
+        stepStreamingMs = officialTiming.streamingMs;
+        stepTtftMs = officialTiming.ttftMs;
+      } else {
+        const nextStep = parsed.steps[idx + 1];
+        if (
+          nextStep &&
+          nextStep.type !== 'USER_INPUT' &&
+          nextStep.createdMs > s.createdMs &&
+          nextStep.createdMs - s.createdMs < 180_000
+        ) {
+          modelDurMs = nextStep.createdMs - s.createdMs;
+        } else if (
+          prevStepMs > 0 &&
+          (prevStepType === 'USER_INPUT' || prevStepType === 'GENERIC') &&
+          s.createdMs > prevStepMs &&
+          s.createdMs - prevStepMs < 60_000
+        ) {
+          modelDurMs = s.createdMs - prevStepMs;
+        }
+      }
+      totalModelDurationMs += modelDurMs;
+      if (stepStreamingMs > 0 && s.outputTokens > 0) {
+        totalStreamingMs += stepStreamingMs;
+        totalStreamingOutputTokens += s.outputTokens;
+      }
+      if (stepTtftMs > 0) {
+        totalTtftMs += stepTtftMs;
+        ttftSamples++;
       }
       prevStepMs = s.createdMs || prevStepMs;
+      prevStepType = s.type;
 
       responseThinkingEst += s.thinkingTokensEst || 0;
       responseAnswerEst += s.answerTokensEst || 0;
@@ -283,28 +327,41 @@ async function buildConversationProjection(convId, transcriptPath, meta) {
         if (s.createdMs > commands[prog].lastUsedMs) commands[prog].lastUsedMs = s.createdMs;
       }
       prevStepMs = s.createdMs || prevStepMs;
+      prevStepType = s.type;
     }
   }
 
   // Final composition snapshot. The official breakdown is exact for the
   // latest request; otherwise the transcript estimate is used.
+  const compactedAfterLatestPlanner = lastCheckpointStepIndex > lastPlannerStepIndex;
+  const officialFixed = official ? officialFixedTotals(official) : null;
+  const officialFixedTotal = officialFixed
+    ? Object.values(officialFixed).reduce((acc, v) => acc + v, 0)
+    : 0;
   const visSum = cum.user + cum.injected + cum.skills + cum.thinking + cum.assistant + cum.tools + cum.media + cum.other;
-  const latestOfficialComposition = official?.hasBreakdown
-    ? officialCompositionWithSplit(official, {
-        thinking: responseThinkingEst,
-        answer: responseAnswerEst,
-        tool: responseToolEst,
-      })
-    : null;
-  const effectivePrompt = official?.usedTokens || latestPromptTokens || visSum;
   const barCum = {
     ...cum,
     assistant: cum.assistant + cum.thinking + cum.toolCall,
     thinking: 0,
     tools: cum.toolResult,
   };
-  const latestComposition = latestOfficialComposition
-    || estimateComposition(barCum, effectivePrompt, official).composition;
+  let effectivePrompt;
+  let latestComposition;
+  if (compactedAfterLatestPlanner) {
+    effectivePrompt = officialFixedTotal + visSum;
+    latestComposition = estimateComposition(barCum, effectivePrompt, official).composition;
+  } else {
+    const latestOfficialComposition = official?.hasBreakdown
+      ? officialCompositionWithSplit(official, {
+          thinking: responseThinkingEst,
+          answer: responseAnswerEst,
+          tool: responseToolEst,
+        })
+      : null;
+    effectivePrompt = official?.usedTokens || latestPromptTokens || visSum;
+    latestComposition = latestOfficialComposition
+      || estimateComposition(barCum, effectivePrompt, official).composition;
+  }
 
   const totalPromptAll = totalInput + totalCacheRead;
   const cacheHitRate = totalPromptAll > 0 ? totalCacheRead / totalPromptAll : 0;
@@ -320,6 +377,12 @@ async function buildConversationProjection(convId, transcriptPath, meta) {
   const spec = getModelSpec(latestModel);
   const effectiveWindow = official?.maxContextTokens || latestWindow || spec.contextWindow;
   const nativeWindow = Math.max(official?.nativeContextWindow || 0, spec.contextWindow, effectiveWindow);
+
+  const officialTotals = official?.timing?.totals || null;
+  const effectiveStreamMs = totalStreamingMs > 0 ? totalStreamingMs : (officialTotals?.streamingMs || 0);
+  const effectiveStreamOut = totalStreamingMs > 0 ? totalStreamingOutputTokens : (officialTotals?.streamingOutputTokens || 0);
+  const effectiveTtftMs = ttftSamples > 0 ? totalTtftMs : (officialTotals?.ttftMs || 0);
+  const effectiveTtftSamples = ttftSamples > 0 ? ttftSamples : (officialTotals?.ttftSamples || 0);
 
   return {
     id: convId,
@@ -354,6 +417,10 @@ async function buildConversationProjection(convId, transcriptPath, meta) {
     modelDurationMs: totalModelDurationMs,
     toolDurationMs: totalToolDurationMs,
     overheadDurationMs: totalOverheadMs,
+    streamingDurationMs: effectiveStreamMs,
+    streamingOutputTokens: effectiveStreamOut,
+    ttftDurationMs: effectiveTtftMs,
+    ttftSamples: effectiveTtftSamples,
     daily,
     skills,
     tools,
@@ -591,6 +658,10 @@ export class ProjectionStore {
       toolMs: 0,
       overheadMs: 0,
       totalActiveMs: 0,
+      streamingMs: 0,
+      streamingOutputTokens: 0,
+      ttftMs: 0,
+      ttftSamples: 0,
     };
 
     const skillAgg = new Map();
@@ -730,6 +801,10 @@ export class ProjectionStore {
       timingAgg.toolMs += Math.round((c.toolDurationMs || 0) * ratio);
       timingAgg.overheadMs += Math.round((c.overheadDurationMs || 0) * ratio);
       timingAgg.totalActiveMs += Math.round((c.activeDurationMs || 0) * ratio);
+      timingAgg.streamingMs += Math.round((c.streamingDurationMs || 0) * ratio);
+      timingAgg.streamingOutputTokens += Math.round((c.streamingOutputTokens || 0) * ratio);
+      timingAgg.ttftMs += Math.round((c.ttftDurationMs || 0) * ratio);
+      timingAgg.ttftSamples += Math.round((c.ttftSamples || 0) * ratio);
       for (const k of Object.keys(compAgg)) {
         compAgg[k] += Math.round((c.billableBuckets?.[k] || 0) * ratio);
       }
@@ -770,6 +845,13 @@ export class ProjectionStore {
     const sortRank = (m) =>
       [...m.values()].sort((a, b) => b.count - a.count || b.lastUsedMs - a.lastUsedMs).slice(0, 20);
 
+    const endToEndTokensPerSec = timingAgg.modelMs > 0 ? Math.round(kpi.outputTokens / (timingAgg.modelMs / 1000)) : 0;
+    const outputTokensPerSec = timingAgg.streamingMs > 0 && timingAgg.streamingOutputTokens > 0
+      ? Math.round(timingAgg.streamingOutputTokens / (timingAgg.streamingMs / 1000))
+      : endToEndTokensPerSec;
+    const avgTtftMs = timingAgg.ttftSamples > 0 ? Math.round(timingAgg.ttftMs / timingAgg.ttftSamples) : 0;
+    const speedSource = timingAgg.streamingMs > 0 && timingAgg.streamingOutputTokens > 0 ? 'streaming' : 'estimated';
+
     return {
       generatedAt: Date.now(),
       range,
@@ -778,7 +860,10 @@ export class ProjectionStore {
       kpi,
       timing: {
         ...timingAgg,
-        outputTokensPerSec: timingAgg.modelMs > 0 ? Math.round(kpi.outputTokens / (timingAgg.modelMs / 1000)) : 0,
+        avgTtftMs,
+        outputTokensPerSec,
+        endToEndTokensPerSec,
+        speedSource,
       },
       chart7Days,
       heatmap56,

@@ -281,7 +281,7 @@
     }
   }
 
-  async function loadContextSession() {
+  async function loadContextSession(force = false) {
     if (isAuxPane) {
       const hostConv = AGY.bridge.getHostConversationId();
       if (hostConv && hostConv !== appState.hostSessionId) {
@@ -312,7 +312,7 @@
 
     try {
       const stepParam = appState.timeline.pinnedSeq >= 0 ? appState.timeline.pinnedSeq : '';
-      const payload = await AGY.bridge.apiFetch(`/api/session${qs({ id: targetId, step: stepParam })}`);
+      const payload = await AGY.bridge.apiFetch(`/api/session${qs({ id: targetId, step: stepParam, force: force ? 1 : '' })}`);
       if (myToken !== sessionLoadToken) return;
       appState.sessionsList = payload.sessions || [];
       if (payload.empty || !payload.session) {
@@ -328,7 +328,7 @@
       appState.sessionData.fleet = payload.fleet || null;
       renderTopbar();
       renderMain();
-      await loadStepBrowser(appState.timeline.pinnedSeq);
+      await loadStepBrowser(appState.timeline.pinnedSeq, force);
     } catch (err) {
       if (myToken !== sessionLoadToken) return;
       showError(err);
@@ -365,7 +365,7 @@
     }
 
     try {
-      const data = await AGY.bridge.apiFetch(`/api/fleet${qs({ id: targetId })}`);
+      const data = await AGY.bridge.apiFetch(`/api/fleet${qs({ id: targetId, force: force ? 1 : '' })}`);
       if (myToken !== sessionLoadToken) return;
       if (Array.isArray(data?.sessions) && data.sessions.length > 0) {
         appState.sessionsList = data.sessions;
@@ -401,12 +401,12 @@
     }
   }
 
-  async function loadStepBrowser(seq) {
+  async function loadStepBrowser(seq, force = false) {
     const targetId = (appState.sessionId || '').trim();
     if (!targetId) return;
     try {
       const data = await AGY.bridge.apiFetch(
-        `/api/step${qs({ id: targetId, step: seq >= 0 ? seq : '', baseline: appState.browser.baseline })}`
+        `/api/step${qs({ id: targetId, step: seq >= 0 ? seq : '', baseline: appState.browser.baseline, force: force ? 1 : '' })}`
       );
       if (targetId !== appState.sessionId) return;
       appState.stepData = data?.empty ? null : data;
@@ -793,7 +793,7 @@
   function loadActivePage(force = false) {
     if (appState.page === 'insights') return loadInsights(force);
     if (appState.page === 'fleet') return loadFleet(force);
-    return loadContextSession();
+    return loadContextSession(force);
   }
 
   async function bootstrap() {
@@ -819,7 +819,13 @@
     renderTopbar();
     await loadActivePage();
 
-    // Gentle visibility-gated background refresh every 6s (only when not hovering)
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) {
+        loadActivePage(false);
+      }
+    });
+
+    // Gentle visibility-gated background refresh every 3s (only when not hovering)
     pollTimer = setInterval(() => {
       if (document.hidden || appState.timeline.hoveredSeq >= 0) return;
       const active = document.activeElement;
@@ -839,7 +845,7 @@
       } else if (appState.timeline.pinnedSeq < 0) {
         loadContextSession();
       }
-    }, 6000);
+    }, 3000);
   }
 
   if (document.readyState === 'loading') {

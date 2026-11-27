@@ -18,6 +18,12 @@
     const isZh = getLang() === 'zh';
 
     const pricingTitle = `${t('pricingHint')}\n${meta.modelLabel || meta.model}\nIn: $${p.inputPerM}/1M · Cache: $${p.cacheReadPerM}/1M · Out: $${p.outputPerM}/1M${p.isFallback ? ' (fallback)' : ''}`;
+    const speedLines = [
+      tm.speedSource === 'streaming' ? t('speedTooltipStreaming') : t('speedTooltipEstimated'),
+      tm.avgTtftMs > 0 ? `${t('avgTtftLabel')}: ${fmtDuration(tm.avgTtftMs)}` : '',
+      tm.endToEndTokensPerSec > 0 ? `${t('endToEndSpeedLabel')}: ${tm.endToEndTokensPerSec} tok/s` : '',
+    ].filter(Boolean);
+    const speedTitle = speedLines.join('\n');
     const ioTotal = (cs.userInputs || 0) + (fileOps.read || 0) + (fileOps.written || 0);
     const extraToolsCount = Math.max(0, topTools.length - 2);
 
@@ -212,7 +218,7 @@
         <div class="card">
           <div class="card-header">
             <span class="card-title">◷ ${escHtml(t('timingStats'))}</span>
-            <span class="card-subtitle mono">${escHtml(t('outputSpeed'))} ${tm.outputTokensPerSec || 0} tok/s</span>
+            <span class="card-subtitle mono" style="cursor:help" title="${escHtml(speedTitle)}">${escHtml(t('outputSpeed'))} ${tm.outputTokensPerSec || 0} tok/s</span>
           </div>
           <div id="ctx-timing-donut"></div>
           ${AGY.charts.renderTimingRibbonHtml(timeline?.steps || [], tm.totalActiveMs || 0)}
