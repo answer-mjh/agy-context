@@ -5,6 +5,8 @@ import { parseTranscriptFile, localPathFromUri } from './parser.mjs';
 import { getModelSpec } from './pricing.mjs';
 import { getGeneratorMetadata } from './ls-rpc.mjs';
 import {
+  MIN_OUTPUT_TOKENS_FOR_SPEED,
+  MIN_STREAM_MS,
   estimateComposition,
   normalizeOutputRatios,
   officialCompositionWithSplit,
@@ -137,6 +139,9 @@ export function analyzeSession(convId, parsed, meta, official = null) {
   let totalInputTokens = 0;
   let totalCacheReadTokens = 0;
   let totalOutputTokens = 0;
+  let plannerInputTokens = 0;
+  let plannerCacheReadTokens = 0;
+  let latestStepSpeed = 0;
   let totalCost = 0;
   let totalToolCalls = 0;
   let userInputsCount = 0;
@@ -352,6 +357,8 @@ export function analyzeSession(convId, parsed, meta, official = null) {
       totalInputTokens += s.inputTokens;
       totalCacheReadTokens += s.cacheReadTokens;
       totalOutputTokens += s.outputTokens;
+      plannerInputTokens += s.inputTokens;
+      plannerCacheReadTokens += s.cacheReadTokens;
       totalCost += s.cost;
       totalToolCalls += (s.toolCalls || []).length;
 
@@ -360,11 +367,15 @@ export function analyzeSession(convId, parsed, meta, official = null) {
       // — never include human reading/typing time before the next USER_INPUT.
       let modelDurMs = 0;
       let stepStreamingMs = 0;
+      let stepStreamingExact = 0;
+      let stepSpeedValid = false;
       let stepTtftMs = 0;
       const officialTiming = official?.timing?.byStep?.get(s.stepIndex) || null;
       if (officialTiming && officialTiming.totalMs > 0) {
         modelDurMs = officialTiming.totalMs;
         stepStreamingMs = officialTiming.streamingMs;
+        stepStreamingExact = officialTiming.streamingMsExact ?? officialTiming.streamingMs ?? 0;
+        stepSpeedValid = officialTiming.speedValid ?? (stepStreamingExact >= MIN_STREAM_MS && s.outputTokens >= MIN_OUTPUT_TOKENS_FOR_SPEED);
         stepTtftMs = officialTiming.ttftMs;
       } else {
         const nextStep = steps[i + 1];
@@ -385,9 +396,14 @@ export function analyzeSession(convId, parsed, meta, official = null) {
         }
       }
       totalModelDurationMs += modelDurMs;
-      if (stepStreamingMs > 0 && s.outputTokens > 0) {
-        totalStreamingMs += stepStreamingMs;
+      let stepTps = 0;
+      if (stepSpeedValid) {
+        totalStreamingMs += stepStreamingExact;
         totalStreamingOutputTokens += s.outputTokens;
+        stepTps = Math.round((s.outputTokens / (stepStreamingExact / 1000)) * 10) / 10;
+        latestStepSpeed = stepTps;
+      } else if (modelDurMs >= MIN_STREAM_MS && s.outputTokens >= MIN_OUTPUT_TOKENS_FOR_SPEED) {
+        stepTps = Math.round((s.outputTokens / (modelDurMs / 1000)) * 10) / 10;
       }
       if (stepTtftMs > 0) {
         totalTtftMs += stepTtftMs;
@@ -540,9 +556,7 @@ export function analyzeSession(convId, parsed, meta, official = null) {
         durationMs: modelDurMs,
         streamingMs: stepStreamingMs,
         ttftMs: stepTtftMs,
-        tokensPerSec: stepStreamingMs > 0 && s.outputTokens > 0
-          ? Math.round(s.outputTokens / (stepStreamingMs / 1000))
-          : (modelDurMs > 0 && s.outputTokens > 0 ? Math.round(s.outputTokens / (modelDurMs / 1000)) : 0),
+        tokensPerSec: stepTps,
         actual: {
           inputTokens: s.inputTokens,
           cacheReadTokens: s.cacheReadTokens,
@@ -803,8 +817,10 @@ export function analyzeSession(convId, parsed, meta, official = null) {
   }
 
   const spec = getModelSpec(latestModel);
-  const totalPromptAll = totalInputTokens + totalCacheReadTokens;
-  const cacheHitRate = totalPromptAll > 0 ? totalCacheReadTokens / totalPromptAll : 0;
+  const plannerPromptAll = plannerInputTokens + plannerCacheReadTokens;
+  const cacheHitRate = official?.cache?.totalPromptTokens > 0
+    ? official.cache.cacheHitRate
+    : (plannerPromptAll > 0 ? plannerCacheReadTokens / plannerPromptAll : 0);
   const totalSpanMs = firstMs > 0 && lastMs >= firstMs ? Math.min(lastMs - firstMs, 60_000) : 0;
   const overheadMs = totalOverheadMs;
   const totalActiveMs =
@@ -812,16 +828,22 @@ export function analyzeSession(convId, parsed, meta, official = null) {
       ? totalModelDurationMs + totalToolDurationMs + overheadMs
       : totalSpanMs;
   const officialTotals = official?.timing?.totals || null;
-  const effectiveStreamMs = totalStreamingMs > 0 ? totalStreamingMs : (officialTotals?.streamingMs || 0);
+  const effectiveStreamMs = totalStreamingMs > 0
+    ? totalStreamingMs
+    : (officialTotals?.streamingMsExact || officialTotals?.streamingMs || 0);
   const effectiveStreamOut = totalStreamingMs > 0 ? totalStreamingOutputTokens : (officialTotals?.streamingOutputTokens || 0);
   const effectiveTtftMs = ttftSamples > 0 ? totalTtftMs : (officialTotals?.ttftMs || 0);
   const effectiveTtftSamples = ttftSamples > 0 ? ttftSamples : (officialTotals?.ttftSamples || 0);
-  const endToEndTokensPerSec = totalModelDurationMs > 0 ? Math.round(totalOutputTokens / (totalModelDurationMs / 1000)) : 0;
-  const outputTokensPerSec = effectiveStreamMs > 0 && effectiveStreamOut > 0
-    ? Math.round(effectiveStreamOut / (effectiveStreamMs / 1000))
+  const endToEndTokensPerSec = totalModelDurationMs > 0
+    ? Math.round((totalOutputTokens / (totalModelDurationMs / 1000)) * 10) / 10
+    : 0;
+  const hasStreamingSpeed = effectiveStreamMs >= MIN_STREAM_MS && effectiveStreamOut >= MIN_OUTPUT_TOKENS_FOR_SPEED;
+  const outputTokensPerSec = hasStreamingSpeed
+    ? Math.round((effectiveStreamOut / (effectiveStreamMs / 1000)) * 10) / 10
     : endToEndTokensPerSec;
+  const latestOutputTokensPerSec = officialTotals?.latestOutputTokensPerSec || latestStepSpeed || outputTokensPerSec;
   const avgTtftMs = effectiveTtftSamples > 0 ? Math.round(effectiveTtftMs / effectiveTtftSamples) : 0;
-  const speedSource = effectiveStreamMs > 0 && effectiveStreamOut > 0 ? 'streaming' : 'estimated';
+  const speedSource = hasStreamingSpeed ? 'streaming' : 'estimated';
 
   const toolCountMap = new Map();
   for (const sn of plannerSnapshots) {
@@ -1013,6 +1035,7 @@ export function analyzeSession(convId, parsed, meta, official = null) {
         billableTotal: totalInputTokens + totalCacheReadTokens + totalOutputTokens,
         inputTokens: totalInputTokens,
         cacheReadTokens: totalCacheReadTokens,
+        cacheCreationTokens: official?.cache?.cacheCreationTokens || 0,
         outputTokens: totalOutputTokens,
         cacheHitRate,
         buckets: billableBuckets,
@@ -1022,10 +1045,11 @@ export function analyzeSession(convId, parsed, meta, official = null) {
         toolMs: totalToolDurationMs,
         overheadMs,
         totalActiveMs,
-        streamingMs: effectiveStreamMs,
+        streamingMs: Math.round(effectiveStreamMs),
         ttftMs: effectiveTtftMs,
         avgTtftMs,
         outputTokensPerSec,
+        latestOutputTokensPerSec,
         endToEndTokensPerSec,
         speedSource,
       },

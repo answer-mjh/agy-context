@@ -18,8 +18,12 @@
     const isZh = getLang() === 'zh';
 
     const pricingTitle = `${t('pricingHint')}\n${meta.modelLabel || meta.model}\nIn: $${p.inputPerM}/1M · Cache: $${p.cacheReadPerM}/1M · Out: $${p.outputPerM}/1M${p.isFallback ? ' (fallback)' : ''}`;
+    const primarySpeed = tm.latestOutputTokensPerSec > 0 ? tm.latestOutputTokensPerSec : (tm.outputTokensPerSec || 0);
+    const showAvg = tm.latestOutputTokensPerSec > 0 && tm.outputTokensPerSec > 0 && tm.latestOutputTokensPerSec !== tm.outputTokensPerSec;
     const speedLines = [
       tm.speedSource === 'streaming' ? t('speedTooltipStreaming') : t('speedTooltipEstimated'),
+      tm.latestOutputTokensPerSec > 0 ? `${t('latestSpeedLabel')}: ${tm.latestOutputTokensPerSec} tok/s` : '',
+      tm.outputTokensPerSec > 0 ? `${t('avgSpeedLabel')}: ${tm.outputTokensPerSec} tok/s` : '',
       tm.avgTtftMs > 0 ? `${t('avgTtftLabel')}: ${fmtDuration(tm.avgTtftMs)}` : '',
       tm.endToEndTokensPerSec > 0 ? `${t('endToEndSpeedLabel')}: ${tm.endToEndTokensPerSec} tok/s` : '',
     ].filter(Boolean);
@@ -218,7 +222,7 @@
         <div class="card">
           <div class="card-header">
             <span class="card-title">◷ ${escHtml(t('timingStats'))}</span>
-            <span class="card-subtitle mono" style="cursor:help" title="${escHtml(speedTitle)}">${escHtml(t('outputSpeed'))} ${tm.outputTokensPerSec || 0} tok/s</span>
+            <span class="card-subtitle mono" style="cursor:help" title="${escHtml(speedTitle)}">${escHtml(t('outputSpeed'))} ${primarySpeed} tok/s${showAvg ? ` (${escHtml(t('speedAvgShort'))} ${tm.outputTokensPerSec})` : ''}</span>
           </div>
           <div id="ctx-timing-donut"></div>
           ${AGY.charts.renderTimingRibbonHtml(timeline?.steps || [], tm.totalActiveMs || 0)}

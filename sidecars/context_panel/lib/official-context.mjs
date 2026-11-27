@@ -15,7 +15,10 @@
 import { getModelSpec } from './pricing.mjs';
 import { estimateTokens } from './tokenizer.mjs';
 
-const NUMERIC_KEYS = new Set(['inputTokens', 'cacheReadTokens', 'outputTokens', 'thinkingOutputTokens', 'responseOutputTokens']);
+const NUMERIC_KEYS = new Set(['inputTokens', 'cacheReadTokens', 'cacheCreationTokens', 'outputTokens', 'thinkingOutputTokens', 'responseOutputTokens']);
+
+export const MIN_STREAM_MS = 50;
+export const MIN_OUTPUT_TOKENS_FOR_SPEED = 2;
 
 function toInt(value) {
   if (typeof value === 'number') return Number.isFinite(value) ? Math.max(0, Math.round(value)) : 0;
@@ -167,15 +170,18 @@ function usageOf(chatModel) {
   const usage = chatModel?.usage && typeof chatModel.usage === 'object' ? chatModel.usage : {};
   const inputTokens = toInt(usage.inputTokens);
   const cacheReadTokens = toInt(usage.cacheReadTokens);
+  const cacheCreationTokens = toInt(usage.cacheCreationTokens);
   const outputTokens = toInt(usage.outputTokens);
+  const totalPromptTokens = inputTokens + cacheReadTokens + cacheCreationTokens;
   return {
     inputTokens,
     cacheReadTokens,
+    cacheCreationTokens,
     outputTokens,
     thinkingOutputTokens: toInt(usage.thinkingOutputTokens),
     responseOutputTokens: toInt(usage.responseOutputTokens),
-    totalPromptTokens: inputTokens + cacheReadTokens,
-    totalBillableTokens: inputTokens + cacheReadTokens + outputTokens,
+    totalPromptTokens,
+    totalBillableTokens: totalPromptTokens + outputTokens,
   };
 }
 
@@ -205,6 +211,42 @@ export function parseDurationMs(value) {
 }
 
 /**
+ * Extract additive prompt cache telemetry across all generatorMetadata calls.
+ * Mirrors Context Monitor's `cacheRead / (input + cacheRead + cacheCreation)` metric.
+ */
+function extractCacheTelemetry(entries) {
+  let inputTokens = 0;
+  let cacheReadTokens = 0;
+  let cacheCreationTokens = 0;
+  let totalCalls = 0;
+  let cachedCalls = 0;
+
+  for (const entry of entries) {
+    const chatModel = entry?.chatModel;
+    if (!chatModel || typeof chatModel !== 'object') continue;
+    const usage = usageOf(chatModel);
+    totalCalls++;
+    inputTokens += usage.inputTokens;
+    cacheReadTokens += usage.cacheReadTokens;
+    cacheCreationTokens += usage.cacheCreationTokens;
+    if (usage.cacheReadTokens > 0) cachedCalls++;
+  }
+
+  const totalPromptTokens = inputTokens + cacheReadTokens + cacheCreationTokens;
+  const cacheHitRate = totalPromptTokens > 0 ? cacheReadTokens / totalPromptTokens : 0;
+
+  return {
+    inputTokens,
+    cacheReadTokens,
+    cacheCreationTokens,
+    totalPromptTokens,
+    cacheHitRate,
+    cachedCalls,
+    totalCalls,
+  };
+}
+
+/**
  * Extract per-step and session-total streaming & TTFT timing from generatorMetadata.
  */
 function extractTimingTelemetry(entries) {
@@ -216,6 +258,7 @@ function extractTimingTelemetry(entries) {
   let streamingOutputTokens = 0;
   let samples = 0;
   let ttftSamples = 0;
+  let latestOutputTokensPerSec = 0;
 
   for (const entry of entries) {
     const chatModel = entry?.chatModel;
@@ -227,12 +270,15 @@ function extractTimingTelemetry(entries) {
 
     const usage = usageOf(chatModel);
     const out = usage.outputTokens;
+    const speedValid = stream >= MIN_STREAM_MS && out >= MIN_OUTPUT_TOKENS_FOR_SPEED;
     const stepIndices = Array.isArray(entry.stepIndices)
       ? entry.stepIndices.map(toInt).filter(idx => idx >= 0)
       : [];
 
     const record = {
       streamingMs: Math.round(stream),
+      streamingMsExact: stream,
+      speedValid,
       ttftMs: Math.round(ttft),
       totalMs: Math.round(total),
       outputTokens: out,
@@ -247,10 +293,11 @@ function extractTimingTelemetry(entries) {
       ttftMs += ttft;
       ttftSamples++;
     }
-    if (stream > 0 && out > 0) {
+    if (speedValid) {
       streamingMs += stream;
       streamingOutputTokens += out;
       samples++;
+      latestOutputTokensPerSec = Math.round((out / (stream / 1000)) * 10) / 10;
     }
   }
 
@@ -258,12 +305,14 @@ function extractTimingTelemetry(entries) {
     byStep,
     totals: {
       streamingMs: Math.round(streamingMs),
+      streamingMsExact: streamingMs,
       ttftMs: Math.round(ttftMs),
       totalMs: Math.round(totalMs),
       outputTokens,
       streamingOutputTokens,
       samples,
       ttftSamples,
+      latestOutputTokensPerSec,
     },
   };
 }
@@ -638,6 +687,7 @@ export function parseOfficialContext(generatorMetadata, options = {}) {
     checkpointIndex: checkpointIndexOf(chatModel),
     checkpoints: detectCheckpoints(entries),
     timing: extractTimingTelemetry(entries),
+    cache: extractCacheTelemetry(entries),
     buckets,
     fixed,
     chat,

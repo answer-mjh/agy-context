@@ -6,6 +6,8 @@ import { getModelSpec } from './pricing.mjs';
 import { readConversationMetaMap } from './sqlite-meta.mjs';
 import { getGeneratorMetadata } from './ls-rpc.mjs';
 import {
+  MIN_OUTPUT_TOKENS_FOR_SPEED,
+  MIN_STREAM_MS,
   estimateComposition,
   normalizeOutputRatios,
   officialCompositionWithSplit,
@@ -13,7 +15,7 @@ import {
   parseOfficialContext,
 } from './official-context.mjs';
 
-const CACHE_VERSION = 9;
+const CACHE_VERSION = 10;
 
 function getCachePath() {
   const live = Boolean(process.env.ANTIGRAVITY_LS_ADDRESS && process.env.ANTIGRAVITY_CSRF_TOKEN);
@@ -58,6 +60,8 @@ async function buildConversationProjection(convId, transcriptPath, meta) {
   let totalInput = 0;
   let totalCacheRead = 0;
   let totalOutput = 0;
+  let plannerInput = 0;
+  let plannerCacheRead = 0;
   let totalCost = 0;
   let totalRequests = 0;
   let totalToolCalls = 0;
@@ -102,6 +106,8 @@ async function buildConversationProjection(convId, transcriptPath, meta) {
         date: dk,
         inputTokens: 0,
         cacheReadTokens: 0,
+        cacheEligibleInput: 0,
+        cacheEligibleRead: 0,
         outputTokens: 0,
         billableTokens: 0,
         cost: 0,
@@ -195,6 +201,8 @@ async function buildConversationProjection(convId, transcriptPath, meta) {
       totalInput += s.inputTokens;
       totalCacheRead += s.cacheReadTokens;
       totalOutput += s.outputTokens;
+      plannerInput += s.inputTokens;
+      plannerCacheRead += s.cacheReadTokens;
       totalCost += s.cost;
       if (s.totalPromptTokens > 0) {
         latestPromptTokens = s.totalPromptTokens;
@@ -203,12 +211,14 @@ async function buildConversationProjection(convId, transcriptPath, meta) {
       // Prefer official streamingDuration + timeToFirstToken from language server.
       // When unavailable, estimate from next runtime step ONLY (never human idle before USER_INPUT).
       let modelDurMs = 0;
-      let stepStreamingMs = 0;
+      let stepStreamingExact = 0;
+      let stepSpeedValid = false;
       let stepTtftMs = 0;
       const officialTiming = official?.timing?.byStep?.get(s.stepIndex) || null;
       if (officialTiming && officialTiming.totalMs > 0) {
         modelDurMs = officialTiming.totalMs;
-        stepStreamingMs = officialTiming.streamingMs;
+        stepStreamingExact = officialTiming.streamingMsExact ?? officialTiming.streamingMs ?? 0;
+        stepSpeedValid = officialTiming.speedValid ?? (stepStreamingExact >= MIN_STREAM_MS && s.outputTokens >= MIN_OUTPUT_TOKENS_FOR_SPEED);
         stepTtftMs = officialTiming.ttftMs;
       } else {
         const nextStep = parsed.steps[idx + 1];
@@ -229,8 +239,8 @@ async function buildConversationProjection(convId, transcriptPath, meta) {
         }
       }
       totalModelDurationMs += modelDurMs;
-      if (stepStreamingMs > 0 && s.outputTokens > 0) {
-        totalStreamingMs += stepStreamingMs;
+      if (stepSpeedValid) {
+        totalStreamingMs += stepStreamingExact;
         totalStreamingOutputTokens += s.outputTokens;
       }
       if (stepTtftMs > 0) {
@@ -269,6 +279,8 @@ async function buildConversationProjection(convId, transcriptPath, meta) {
       if (dayEntry) {
         dayEntry.inputTokens += s.inputTokens;
         dayEntry.cacheReadTokens += s.cacheReadTokens;
+        dayEntry.cacheEligibleInput += s.inputTokens;
+        dayEntry.cacheEligibleRead += s.cacheReadTokens;
         dayEntry.outputTokens += s.outputTokens;
         dayEntry.billableTokens += s.totalBillableTokens;
         dayEntry.cost += s.cost;
@@ -363,8 +375,14 @@ async function buildConversationProjection(convId, transcriptPath, meta) {
       || estimateComposition(barCum, effectivePrompt, official).composition;
   }
 
-  const totalPromptAll = totalInput + totalCacheRead;
-  const cacheHitRate = totalPromptAll > 0 ? totalCacheRead / totalPromptAll : 0;
+  const cacheEligibleInputTokens = official?.cache?.totalPromptTokens > 0
+    ? (official.cache.inputTokens + official.cache.cacheCreationTokens)
+    : plannerInput;
+  const cacheEligibleReadTokens = official?.cache?.totalPromptTokens > 0
+    ? official.cache.cacheReadTokens
+    : plannerCacheRead;
+  const totalPromptAll = cacheEligibleInputTokens + cacheEligibleReadTokens;
+  const cacheHitRate = totalPromptAll > 0 ? cacheEligibleReadTokens / totalPromptAll : 0;
   const activeDurationMs =
     totalModelDurationMs + totalToolDurationMs + totalOverheadMs > 0
       ? totalModelDurationMs + totalToolDurationMs + totalOverheadMs
@@ -379,7 +397,9 @@ async function buildConversationProjection(convId, transcriptPath, meta) {
   const nativeWindow = Math.max(official?.nativeContextWindow || 0, spec.contextWindow, effectiveWindow);
 
   const officialTotals = official?.timing?.totals || null;
-  const effectiveStreamMs = totalStreamingMs > 0 ? totalStreamingMs : (officialTotals?.streamingMs || 0);
+  const effectiveStreamMs = totalStreamingMs > 0
+    ? totalStreamingMs
+    : (officialTotals?.streamingMsExact || officialTotals?.streamingMs || 0);
   const effectiveStreamOut = totalStreamingMs > 0 ? totalStreamingOutputTokens : (officialTotals?.streamingOutputTokens || 0);
   const effectiveTtftMs = ttftSamples > 0 ? totalTtftMs : (officialTotals?.ttftMs || 0);
   const effectiveTtftSamples = ttftSamples > 0 ? ttftSamples : (officialTotals?.ttftSamples || 0);
@@ -409,6 +429,8 @@ async function buildConversationProjection(convId, transcriptPath, meta) {
     nativeWindowUsagePct: nativeWindow > 0 ? Math.min(100, (effectivePrompt / nativeWindow) * 100) : 0,
     totalInputTokens: totalInput,
     totalCacheReadTokens: totalCacheRead,
+    cacheEligibleInputTokens,
+    cacheEligibleReadTokens,
     totalOutputTokens: totalOutput,
     totalBillableTokens: totalInput + totalCacheRead + totalOutput,
     cacheHitRate,
@@ -417,7 +439,7 @@ async function buildConversationProjection(convId, transcriptPath, meta) {
     modelDurationMs: totalModelDurationMs,
     toolDurationMs: totalToolDurationMs,
     overheadDurationMs: totalOverheadMs,
-    streamingDurationMs: effectiveStreamMs,
+    streamingDurationMs: Math.round(effectiveStreamMs),
     streamingOutputTokens: effectiveStreamOut,
     ttftDurationMs: effectiveTtftMs,
     ttftSamples: effectiveTtftSamples,
@@ -681,6 +703,8 @@ export class ProjectionStore {
     };
 
     const matchingSessions = [];
+    let kpiCacheEligibleInput = 0;
+    let kpiCacheEligibleRead = 0;
 
     for (const c of allConvs) {
       if (workspaceFilter && c.workspaceName !== workspaceFilter) continue;
@@ -708,6 +732,8 @@ export class ProjectionStore {
       let rangeBillable = 0;
       let rangeInput = 0;
       let rangeCache = 0;
+      let rangeCacheEligIn = 0;
+      let rangeCacheEligRead = 0;
       let rangeOutput = 0;
       let rangeCost = 0;
       let rangeRequests = 0;
@@ -720,6 +746,8 @@ export class ProjectionStore {
         rangeBillable = c.totalBillableTokens;
         rangeInput = c.totalInputTokens;
         rangeCache = c.totalCacheReadTokens;
+        rangeCacheEligIn = c.cacheEligibleInputTokens ?? c.totalInputTokens;
+        rangeCacheEligRead = c.cacheEligibleReadTokens ?? c.totalCacheReadTokens;
         rangeOutput = c.totalOutputTokens;
         rangeCost = c.totalCost;
         rangeRequests = c.requestsCount;
@@ -732,6 +760,8 @@ export class ProjectionStore {
             rangeBillable += dObj.billableTokens || 0;
             rangeInput += dObj.inputTokens || 0;
             rangeCache += dObj.cacheReadTokens || 0;
+            rangeCacheEligIn += dObj.cacheEligibleInput ?? dObj.inputTokens ?? 0;
+            rangeCacheEligRead += dObj.cacheEligibleRead ?? dObj.cacheReadTokens ?? 0;
             rangeOutput += dObj.outputTokens || 0;
             rangeCost += dObj.cost || 0;
             rangeRequests += dObj.requests || 0;
@@ -787,6 +817,8 @@ export class ProjectionStore {
       kpi.inputTokens += rangeInput;
       kpi.cacheReadTokens += rangeCache;
       kpi.outputTokens += rangeOutput;
+      kpiCacheEligibleInput += rangeCacheEligIn;
+      kpiCacheEligibleRead += rangeCacheEligRead;
       kpi.cost += rangeCost;
       kpi.sessionsCount++;
       kpi.turnsCount += rangeTurns;
@@ -825,15 +857,15 @@ export class ProjectionStore {
         requestsCount: range === 'all' && !selectedDay ? c.requestsCount : rangeRequests,
         toolCallsCount: rangeToolCalls,
         billableTokens: rangeBillable,
-        cacheHitRate: rangeInput + rangeCache > 0 ? rangeCache / (rangeInput + rangeCache) : c.cacheHitRate,
+        cacheHitRate: rangeCacheEligIn + rangeCacheEligRead > 0 ? rangeCacheEligRead / (rangeCacheEligIn + rangeCacheEligRead) : c.cacheHitRate,
         cost: rangeCost,
         activeDurationMs: Math.round((c.activeDurationMs || 0) * ratio),
         latestComposition: c.latestComposition,
       });
     }
 
-    const totalPromptKpi = kpi.inputTokens + kpi.cacheReadTokens;
-    kpi.cacheHitRate = totalPromptKpi > 0 ? kpi.cacheReadTokens / totalPromptKpi : 0;
+    const totalPromptKpi = kpiCacheEligibleInput + kpiCacheEligibleRead;
+    kpi.cacheHitRate = totalPromptKpi > 0 ? kpiCacheEligibleRead / totalPromptKpi : 0;
 
     matchingSessions.sort((a, b) => {
       if (sortBy === 'tokens') return b.billableTokens - a.billableTokens;
@@ -845,12 +877,15 @@ export class ProjectionStore {
     const sortRank = (m) =>
       [...m.values()].sort((a, b) => b.count - a.count || b.lastUsedMs - a.lastUsedMs).slice(0, 20);
 
-    const endToEndTokensPerSec = timingAgg.modelMs > 0 ? Math.round(kpi.outputTokens / (timingAgg.modelMs / 1000)) : 0;
-    const outputTokensPerSec = timingAgg.streamingMs > 0 && timingAgg.streamingOutputTokens > 0
-      ? Math.round(timingAgg.streamingOutputTokens / (timingAgg.streamingMs / 1000))
+    const endToEndTokensPerSec = timingAgg.modelMs > 0
+      ? Math.round((kpi.outputTokens / (timingAgg.modelMs / 1000)) * 10) / 10
+      : 0;
+    const hasStreamingSpeed = timingAgg.streamingMs >= MIN_STREAM_MS && timingAgg.streamingOutputTokens >= MIN_OUTPUT_TOKENS_FOR_SPEED;
+    const outputTokensPerSec = hasStreamingSpeed
+      ? Math.round((timingAgg.streamingOutputTokens / (timingAgg.streamingMs / 1000)) * 10) / 10
       : endToEndTokensPerSec;
     const avgTtftMs = timingAgg.ttftSamples > 0 ? Math.round(timingAgg.ttftMs / timingAgg.ttftSamples) : 0;
-    const speedSource = timingAgg.streamingMs > 0 && timingAgg.streamingOutputTokens > 0 ? 'streaming' : 'estimated';
+    const speedSource = hasStreamingSpeed ? 'streaming' : 'estimated';
 
     return {
       generatedAt: Date.now(),

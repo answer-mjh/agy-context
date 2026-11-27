@@ -15,17 +15,29 @@ async function run() {
         model: 'MODEL_PLACEHOLDER_M532',
         streamingDuration: '7.574362700s',
         timeToFirstToken: '10.668614500s',
-        usage: { inputTokens: '3597', cacheReadTokens: '392366', outputTokens: '1310' },
+        usage: { inputTokens: '3597', cacheReadTokens: '392366', cacheCreationTokens: '4037', outputTokens: '1310' },
+      },
+    },
+    {
+      stepIndices: [2],
+      chatModel: {
+        model: 'MODEL_PLACEHOLDER_M532',
+        streamingDuration: '0.00158s',
+        timeToFirstToken: '0.5s',
+        usage: { inputTokens: '0', cacheReadTokens: '0', outputTokens: '401' },
       },
     },
   ]);
   assert.ok(parsedTiming?.timing?.byStep?.get(1));
+  assert.equal(parsedTiming.timing.totals.samples, 1);
   assert.equal(parsedTiming.timing.totals.streamingOutputTokens, 1310);
+  assert.equal(parsedTiming.timing.totals.latestOutputTokensPerSec, 173);
   assert.equal(
-    Math.round(parsedTiming.timing.totals.streamingOutputTokens / (parsedTiming.timing.totals.streamingMs / 1000)),
+    Math.round(parsedTiming.timing.totals.streamingOutputTokens / (parsedTiming.timing.totals.streamingMsExact / 1000)),
     173
   );
-  console.log('[verify] Official streamingDuration/TTFT parsing OK');
+  assert.ok(Math.abs(parsedTiming.cache.cacheHitRate - 392366 / (3597 + 392366 + 4037)) < 1e-6);
+  console.log('[verify] Official streamingDuration/TTFT/cache parsing OK');
 
   // 0b. Post-compaction context drop unit test (CHECKPOINT after latest PLANNER_RESPONSE)
   const staleOfficial = parseOfficialContext([
@@ -119,6 +131,11 @@ async function run() {
     postCompactAnalyzed.currentContext.actual.totalPromptTokens,
     postCompactAnalyzed.currentContext.composition.total
   );
+  assert.ok(
+    Math.abs(postCompactAnalyzed.stats.tokens.cacheHitRate - 390000 / 400000) < 1e-6,
+    `Expected cacheHitRate to exclude CHECKPOINT (0.975), got ${postCompactAnalyzed.stats.tokens.cacheHitRate}`
+  );
+  assert.equal(postCompactAnalyzed.stats.tokens.billableTotal, 813500);
   console.log(`[verify] Post-compaction context reset OK: ${postCompactAnalyzed.currentContext.composition.total} tokens`);
 
   const router = createRouter({ version: '0.1.0-test' });
