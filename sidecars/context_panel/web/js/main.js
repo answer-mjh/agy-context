@@ -32,12 +32,19 @@
       hmMetric: 'tokens',
     },
     // Context dashboard state
+    insightsRev: '',
+    insightsQueryKey: '',
     sessionId: initialHostId,
     hostSessionId: initialHostId,
     emptyReason: '',
     sessionsList: [],
     sessionData: null,
+    sessionRev: '',
+    sessionQueryKey: '',
     stepData: null,
+    stepRev: '',
+    stepQueryKey: '',
+    stepItemCache: new Map(),
     timeline: {
       granularity: 'step',
       mode: 'total',
@@ -54,9 +61,10 @@
       rawItems: new Set(),
       catSort: {},
     },
-    events: { type: 'all' },
-    files: { kind: 'all', search: '', sortBy: 'ops', expanded: new Set() },
-    commands: { status: 'all', search: '', program: '' },
+    events: { type: 'all', collapsed: false },
+    calls: { collapsed: false, filter: 'all', page: 1, pageSize: 20 },
+    files: { kind: 'all', search: '', sortBy: 'ops', expanded: new Set(), collapsed: false },
+    commands: { status: 'all', search: '', program: '', collapsed: false },
     fleet: {
       data: null,
       selectedAgent: '',
@@ -136,7 +144,8 @@
         if (nextPage !== appState.page) {
           appState.page = nextPage;
           renderTopbar();
-          loadActivePage();
+          renderMain();
+          loadActivePage(false);
         }
       });
     });
@@ -154,9 +163,11 @@
         appState.sessionId = sessSel.value;
         appState.timeline.pinnedSeq = -1;
         appState.timeline.hoveredSeq = -1;
+        appState.calls.page = 1;
         appState.browser.openItems.clear();
         appState.sessionData = null;
         appState.stepData = null;
+        clearSessionCaches();
         appState.fleet.data = null;
         appState.fleet.signature = '';
         appState.fleet.selectedAgent = '';
@@ -226,6 +237,46 @@
     if (!patch || patch.browserBaseline) appState.browser.baseline = appState.prefs.browserBaseline;
   }
 
+  function clearSessionCaches() {
+    appState.sessionRev = '';
+    appState.sessionQueryKey = '';
+    appState.stepRev = '';
+    appState.stepQueryKey = '';
+    appState.stepItemCache.clear();
+  }
+
+  function getCachedStepItem(itemId) {
+    if (!itemId) return null;
+    const seq = appState.stepData?.seq ?? -1;
+    return appState.stepItemCache.get(`${appState.sessionId}:${seq}:${itemId}`) || null;
+  }
+
+  async function loadStepItemDetail(itemId) {
+    const targetId = (appState.sessionId || '').trim();
+    const seq = appState.stepData?.seq ?? appState.timeline.pinnedSeq;
+    if (!targetId || !itemId) return null;
+    const cacheKey = `${targetId}:${seq}:${itemId}`;
+    if (appState.stepItemCache.has(cacheKey)) {
+      return appState.stepItemCache.get(cacheKey);
+    }
+    try {
+      const res = await AGY.bridge.apiFetch(
+        `/api/step${qs({ id: targetId, step: seq >= 0 ? seq : '', baseline: appState.browser.baseline, itemId })}`
+      );
+      const detail = res?.detail || null;
+      if (detail) {
+        appState.stepItemCache.set(cacheKey, detail);
+        while (appState.stepItemCache.size > 80) {
+          const oldest = appState.stepItemCache.keys().next().value;
+          appState.stepItemCache.delete(oldest);
+        }
+      }
+      return detail;
+    } catch {
+      return null;
+    }
+  }
+
   function syncHostConversation(nextHostId) {
     if (!isAuxPane) return false;
     const clean = typeof nextHostId === 'string' ? nextHostId.trim() : '';
@@ -235,8 +286,10 @@
     appState.emptyReason = '';
     appState.sessionData = null;
     appState.stepData = null;
+    clearSessionCaches();
     appState.timeline.pinnedSeq = -1;
     appState.timeline.hoveredSeq = -1;
+    appState.calls.page = 1;
     appState.browser.openItems.clear();
     appState.fleet.data = null;
     appState.fleet.signature = '';
@@ -265,9 +318,17 @@
     if (query.range !== 'weekly_quota' || query.quotaPool === 'all') {
       delete query.quotaPool;
     }
+    const queryKey = JSON.stringify(Object.assign({}, query, { force: undefined }));
+    const revParam = !force && appState.insightsData && appState.insightsQueryKey === queryKey
+      ? appState.insightsRev
+      : '';
+    if (revParam) query.rev = revParam;
     try {
       const data = await AGY.bridge.apiFetch(`/api/insights${qs(query)}`);
+      if (data?.unchanged) return;
       appState.insightsData = data;
+      appState.insightsRev = data.rev || '';
+      appState.insightsQueryKey = queryKey;
       if (Array.isArray(data.sessions)) {
         appState.sessionsList = data.sessions.map(s => ({
           id: s.id,
@@ -279,7 +340,7 @@
           billableTokens: s.billableTokens,
         }));
       }
-      renderMain();
+      if (appState.page === 'insights') renderMain();
     } catch (err) {
       showError(err);
     }
@@ -316,18 +377,28 @@
 
     try {
       const stepParam = appState.timeline.pinnedSeq >= 0 ? appState.timeline.pinnedSeq : '';
-      const payload = await AGY.bridge.apiFetch(`/api/session${qs({ id: targetId, step: stepParam, force: force ? 1 : '' })}`);
+      const queryKey = `${targetId}|${stepParam}`;
+      const revParam = !force && appState.sessionData && appState.sessionQueryKey === queryKey
+        ? appState.sessionRev
+        : '';
+      const payload = await AGY.bridge.apiFetch(
+        `/api/session${qs({ id: targetId, step: stepParam, rev: revParam, force: force ? 1 : '' })}`
+      );
       if (myToken !== sessionLoadToken) return;
+      if (payload?.unchanged) return;
       appState.sessionsList = payload.sessions || [];
       if (payload.empty || !payload.session) {
         appState.sessionData = null;
         appState.stepData = null;
+        clearSessionCaches();
         appState.emptyReason = payload.reason || 'no_transcript_yet';
         renderTopbar();
         renderMain();
         return;
       }
       appState.emptyReason = '';
+      appState.sessionRev = payload.rev || '';
+      appState.sessionQueryKey = queryKey;
       appState.sessionData = payload.session;
       appState.sessionData.fleet = payload.fleet || null;
       renderTopbar();
@@ -408,14 +479,44 @@
   async function loadStepBrowser(seq, force = false) {
     const targetId = (appState.sessionId || '').trim();
     if (!targetId) return;
+    const searchQ = (appState.browser.search || '').trim();
+    const queryKey = `${targetId}|${seq}|${appState.browser.baseline}|${searchQ}`;
+    const revParam = !force && !searchQ && appState.stepData && appState.stepQueryKey === queryKey
+      ? appState.stepRev
+      : '';
     try {
       const data = await AGY.bridge.apiFetch(
-        `/api/step${qs({ id: targetId, step: seq >= 0 ? seq : '', baseline: appState.browser.baseline, force: force ? 1 : '' })}`
+        `/api/step${qs({
+          id: targetId,
+          step: seq >= 0 ? seq : '',
+          baseline: appState.browser.baseline,
+          q: searchQ,
+          rev: revParam,
+          force: force ? 1 : '',
+        })}`
       );
       if (targetId !== appState.sessionId) return;
+      if (data?.unchanged) return;
+      appState.stepRev = data?.rev || '';
+      appState.stepQueryKey = queryKey;
       appState.stepData = data?.empty ? null : data;
       const host = document.getElementById('ctx-browser-host');
-      if (host) renderBrowserSection(host);
+      if (host) {
+        const prevInput = host.querySelector('#br-search');
+        const wasFocused = prevInput && document.activeElement === prevInput;
+        const selStart = wasFocused ? prevInput.selectionStart : null;
+        const selEnd = wasFocused ? prevInput.selectionEnd : null;
+        renderBrowserSection(host);
+        if (wasFocused) {
+          const nextInput = host.querySelector('#br-search');
+          if (nextInput) {
+            nextInput.focus();
+            if (selStart !== null && selEnd !== null) {
+              nextInput.setSelectionRange(selStart, selEnd);
+            }
+          }
+        }
+      }
     } catch {
       // ignore transient hover fetch errors
     }
@@ -474,7 +575,9 @@
 
     // Context Dashboard (DSH Layout)
     if (!appState.sessionData) {
-      main.innerHTML = renderSessionEmptyMessage();
+      main.innerHTML = appState.emptyReason
+        ? renderSessionEmptyMessage()
+        : `<div class="card"><div class="empty-state">${AGY.i18n.escHtml(AGY.i18n.t('commonLoading'))}</div></div>`;
       return;
     }
 
@@ -487,6 +590,7 @@
         </div>
         <div id="ctx-browser-host"></div>
       </div>
+      <div id="ctx-calls-host"></div>
       <div id="ctx-events-host"></div>
       <div id="ctx-files-host"></div>
       <div id="ctx-commands-host"></div>
@@ -496,6 +600,7 @@
     AGY.views.stats.renderCurrentContext(document.getElementById('ctx-current-host'), appState.sessionData);
     renderTimelineSection(document.getElementById('ctx-timeline-host'));
     renderBrowserSection(document.getElementById('ctx-browser-host'));
+    renderCallsSection(document.getElementById('ctx-calls-host'));
     renderEventsSection(document.getElementById('ctx-events-host'));
     renderFilesSection(document.getElementById('ctx-files-host'));
     renderCommandsSection(document.getElementById('ctx-commands-host'));
@@ -615,8 +720,10 @@
     appState.page = 'context';
     appState.sessionData = null;
     appState.stepData = null;
+    clearSessionCaches();
     appState.timeline.pinnedSeq = -1;
     appState.timeline.hoveredSeq = -1;
+    appState.calls.page = 1;
     appState.browser.openItems.clear();
     appState.fleet.selectedAgent = id;
     appState.fleet.data = null;
@@ -670,19 +777,17 @@
       },
       onSearch: (q) => {
         appState.browser.search = q;
-        renderBrowserSection(host);
-        const inp = host.querySelector('#br-search');
-        if (inp) { inp.focus(); inp.setSelectionRange(q.length, q.length); }
+        loadStepBrowser(appState.timeline.pinnedSeq);
       },
-      onToggleCat: (key) => {
+      onToggleCat: (key, opts) => {
         if (appState.browser.openCats.has(key)) appState.browser.openCats.delete(key);
         else appState.browser.openCats.add(key);
-        renderBrowserSection(host);
+        if (!opts?.silent) renderBrowserSection(host);
       },
-      onToggleItem: (id) => {
+      onToggleItem: (id, opts) => {
         if (appState.browser.openItems.has(id)) appState.browser.openItems.delete(id);
         else appState.browser.openItems.add(id);
-        renderBrowserSection(host);
+        if (!opts?.silent) renderBrowserSection(host);
       },
       onChangeAssistantKind: (k) => {
         appState.browser.assistantKind = k;
@@ -692,11 +797,13 @@
         appState.browser.catSort[key] = mode;
         renderBrowserSection(host);
       },
-      onToggleRaw: (id) => {
+      onToggleRaw: (id, opts) => {
         if (appState.browser.rawItems.has(id)) appState.browser.rawItems.delete(id);
         else appState.browser.rawItems.add(id);
-        renderBrowserSection(host);
+        if (!opts?.silent) renderBrowserSection(host);
       },
+      getCachedDetail: (itemId) => getCachedStepItem(itemId),
+      onLoadItemDetail: (itemId) => loadStepItemDetail(itemId),
       onOpenDnaPos: (pos) => {
         const key = `dna-${pos}`;
         appState.browser.openItems.add(key);
@@ -707,9 +814,49 @@
     });
   }
 
+  function renderCallsSection(host) {
+    if (!host || !AGY.views.calls) return;
+    const steps = appState.sessionData?.timeline?.steps || [];
+    AGY.views.calls.render(
+      host,
+      steps,
+      Object.assign({}, appState.calls, { pinnedSeq: appState.timeline.pinnedSeq }),
+      {
+        onToggleCollapse: (nextCollapsed, opts) => {
+          appState.calls.collapsed = typeof nextCollapsed === 'boolean' ? nextCollapsed : !appState.calls.collapsed;
+          if (!opts?.silent) renderCallsSection(host);
+        },
+        onChangeFilter: (f) => {
+          appState.calls.filter = f || 'all';
+          appState.calls.page = 1;
+          renderCallsSection(host);
+        },
+        onChangePage: (p) => {
+          appState.calls.page = Math.max(1, Number(p) || 1);
+          renderCallsSection(host);
+        },
+        onChangePageSize: (sz) => {
+          appState.calls.pageSize = Number(sz) || 20;
+          appState.calls.page = 1;
+          renderCallsSection(host);
+        },
+        onJumpSeq: (seq) => {
+          appState.timeline.pinnedSeq = seq;
+          appState.timeline.hoveredSeq = -1;
+          loadContextSession();
+          document.getElementById('ctx-timeline-host')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        },
+      }
+    );
+  }
+
   function renderEventsSection(host) {
     if (!host) return;
     AGY.views.events.render(host, appState.sessionData.events, appState.events, {
+      onToggleCollapse: (nextCollapsed, opts) => {
+        appState.events.collapsed = typeof nextCollapsed === 'boolean' ? nextCollapsed : !appState.events.collapsed;
+        if (!opts?.silent) renderEventsSection(host);
+      },
       onChangeType: (t) => {
         appState.events.type = t;
         renderEventsSection(host);
@@ -725,6 +872,10 @@
   function renderFilesSection(host) {
     if (!host) return;
     AGY.views.files.render(host, appState.sessionData.fileActivity, appState.files, {
+      onToggleCollapse: (nextCollapsed, opts) => {
+        appState.files.collapsed = typeof nextCollapsed === 'boolean' ? nextCollapsed : !appState.files.collapsed;
+        if (!opts?.silent) renderFilesSection(host);
+      },
       onChangeKind: (k) => {
         appState.files.kind = k;
         renderFilesSection(host);
@@ -739,10 +890,10 @@
         appState.files.sortBy = s;
         renderFilesSection(host);
       },
-      onToggleFile: (fp) => {
+      onToggleFile: (fp, opts) => {
         if (appState.files.expanded.has(fp)) appState.files.expanded.delete(fp);
         else appState.files.expanded.add(fp);
-        renderFilesSection(host);
+        if (!opts?.silent) renderFilesSection(host);
       },
       onJumpToBrowserStep: async (seq, stepIdx) => {
         appState.timeline.pinnedSeq = seq;
@@ -764,6 +915,10 @@
   function renderCommandsSection(host) {
     if (!host) return;
     AGY.views.commands.render(host, appState.sessionData.commands, appState.commands, {
+      onToggleCollapse: (nextCollapsed, opts) => {
+        appState.commands.collapsed = typeof nextCollapsed === 'boolean' ? nextCollapsed : !appState.commands.collapsed;
+        if (!opts?.silent) renderCommandsSection(host);
+      },
       onChangeStatus: (s) => {
         appState.commands.status = s;
         renderCommandsSection(host);

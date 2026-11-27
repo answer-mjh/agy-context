@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
 import { createRouter, startStandaloneServer } from '../sidecars/context_panel/lib/router.mjs';
-import { parseDurationMs, parseOfficialContext } from '../sidecars/context_panel/lib/official-context.mjs';
+import {
+  classifyCacheStart,
+  evaluateCallSpeed,
+  parseDurationMs,
+  parseOfficialContext,
+} from '../sidecars/context_panel/lib/official-context.mjs';
 import { analyzeSession } from '../sidecars/context_panel/lib/session-detail.mjs';
 import {
   WEEKLY_WINDOW_MS,
@@ -205,6 +210,134 @@ async function run() {
   assert.equal(winFallback.cycleEndMs - winFallback.cycleStartMs, WEEKLY_WINDOW_MS);
   console.log('[verify] Weekly quota parsing & window resolution OK');
 
+  // 0d. Per-call telemetry diagnostics & 2-pass orchestrator/executor attribution tests
+  assert.equal(classifyCacheStart(0.05, 1000), 'cold');
+  assert.equal(classifyCacheStart(0.4, 1000), 'partial');
+  assert.equal(classifyCacheStart(0.95, 1000), 'warm');
+  assert.equal(classifyCacheStart(0.9, 0), 'unknown');
+
+  const shortBurst = evaluateCallSpeed(170, 1.58);
+  assert.equal(shortBurst.isShortSample, true);
+  assert.equal(shortBurst.displaySpeed, null);
+  const shortTokens = evaluateCallSpeed(10, 500);
+  assert.equal(shortTokens.isShortSample, true);
+  assert.equal(shortTokens.displaySpeed, null);
+  const validSpeed = evaluateCallSpeed(669, 6180);
+  assert.equal(validSpeed.isShortSample, false);
+  assert.equal(validSpeed.displaySpeed, 108.3);
+
+  const mockCallsOfficial = parseOfficialContext([
+    {
+      stepIndices: [2],
+      chatModel: {
+        model: 'MODEL_PLACEHOLDER_M532',
+        responseModel: 'gemini-4-neon',
+        streamingDuration: '6.18s',
+        timeToFirstToken: '2.5s',
+        usage: { inputTokens: '1000', cacheReadTokens: '9000', outputTokens: '669', thinkingOutputTokens: '335' },
+      },
+    },
+    {
+      stepIndices: [3],
+      plannerConfig: { planExecuteConfig: { executionModel: 'MODEL_PLACEHOLDER_M525' } },
+      chatModel: {
+        model: 'MODEL_PLACEHOLDER_M532',
+        responseModel: 'gemini-4-neon',
+        streamingDuration: '4.0s',
+        timeToFirstToken: '1.2s',
+        usage: { inputTokens: '2000', cacheReadTokens: '10000', outputTokens: '400', responseOutputTokens: '250' },
+        retryInfos: [{ error: 'transient' }, {}],
+      },
+    },
+    {
+      stepIndices: [4],
+      error: 'rate limit exceeded',
+      chatModel: {
+        model: 'MODEL_PLACEHOLDER_M525',
+        responseModel: 'gemini-4-hydrogen',
+        streamingDuration: '0.01s',
+        timeToFirstToken: '1.0s',
+        usage: { inputTokens: '13000', cacheReadTokens: '0', outputTokens: '20' },
+      },
+    },
+  ]);
+  const callsAnalyzed = analyzeSession(
+    'calls-attrib-test',
+    {
+      mtimeMs: Date.now(),
+      size: 1000,
+      isFull: true,
+      steps: [
+        { stepIndex: 1, turnIndex: 1, type: 'USER_INPUT', createdAt: '2026-11-27T10:00:00Z', createdMs: 1700000000000, cleanText: 'go', rawText: 'go', tokensEst: 20, mediaTokensEst: 0 },
+        { stepIndex: 2, turnIndex: 1, type: 'PLANNER_RESPONSE', createdAt: '2026-11-27T10:00:05Z', createdMs: 1700000005000, model: 'gemini-4-neon-high', modelLabel: 'Gemini', contextWindow: 512000, maxOutput: 65536, inputTokens: 1000, cacheReadTokens: 9000, outputTokens: 669, totalPromptTokens: 10000, totalBillableTokens: 10669, cost: 0.02, thinkingTokensEst: 100, answerTokensEst: 569, toolCallTokensEst: 0, toolCalls: [] },
+        { stepIndex: 3, turnIndex: 1, type: 'PLANNER_RESPONSE', createdAt: '2026-11-27T10:00:15Z', createdMs: 1700000015000, model: 'gemini-4-neon-high', modelLabel: 'Gemini', contextWindow: 512000, maxOutput: 65536, inputTokens: 2000, cacheReadTokens: 10000, outputTokens: 400, totalPromptTokens: 12000, totalBillableTokens: 12400, cost: 0.03, thinkingTokensEst: 50, answerTokensEst: 350, toolCallTokensEst: 0, toolCalls: [] },
+        { stepIndex: 4, turnIndex: 1, type: 'PLANNER_RESPONSE', createdAt: '2026-11-27T10:00:25Z', createdMs: 1700000025000, model: 'gemini-4-hydrogen-high', modelLabel: 'Gemini', contextWindow: 512000, maxOutput: 65536, inputTokens: 13000, cacheReadTokens: 0, outputTokens: 20, totalPromptTokens: 13000, totalBillableTokens: 13020, cost: 0.04, thinkingTokensEst: 0, answerTokensEst: 20, toolCallTokensEst: 0, toolCalls: [] },
+      ],
+    },
+    { title: 'attrib-test' },
+    mockCallsOfficial
+  );
+  const cs = callsAnalyzed.timeline.steps;
+  assert.equal(cs.length, 3);
+  assert.equal(cs[0].callRole, 'orchestrator');
+  assert.equal(cs[0].actual.thinkingPct, 50);
+  assert.equal(cs[0].actual.cacheStart, 'warm');
+  assert.equal(cs[0].netDeltaTokens, null);
+  assert.equal(cs[1].callRole, 'orchestrator');
+  assert.equal(cs[1].actual.thinkingOutputTokens, 150);
+  assert.equal(cs[1].actual.thinkingPct, 38);
+  assert.equal(cs[1].netDeltaTokens, 2000);
+  assert.equal(cs[1].callStatus, 'retry');
+  assert.equal(cs[1].retries, 1);
+  assert.equal(cs[2].callRole, 'executor');
+  assert.equal(cs[2].isColdCacheSwitch, true);
+  assert.equal(cs[2].isShortSample, true);
+  assert.equal(cs[2].callStatus, 'error');
+  assert.equal(cs[2].errorMessage, 'rate limit exceeded');
+
+  // Regression: planner has exit_plan_mode (no executionModel field), executor has cid === executionModel
+  const handoffOfficial = parseOfficialContext([
+    {
+      stepIndices: [2],
+      chatModel: {
+        model: 'MODEL_PLACEHOLDER_M532',
+        responseModel: 'gemini-4-neon',
+        streamingDuration: '2.0s',
+        timeToFirstToken: '1.0s',
+        usage: { inputTokens: '500', cacheReadTokens: '4500', outputTokens: '200' },
+      },
+    },
+    {
+      stepIndices: [3],
+      plannerConfig: { planExecuteConfig: { executionModel: 'MODEL_PLACEHOLDER_M525' } },
+      chatModel: {
+        model: 'MODEL_PLACEHOLDER_M525',
+        responseModel: 'gemini-4-hydrogen',
+        streamingDuration: '2.0s',
+        timeToFirstToken: '1.0s',
+        usage: { inputTokens: '600', cacheReadTokens: '4400', outputTokens: '300' },
+      },
+    },
+  ]);
+  const handoffAnalyzed = analyzeSession(
+    'calls-handoff-regression',
+    {
+      mtimeMs: Date.now(),
+      size: 500,
+      isFull: true,
+      steps: [
+        { stepIndex: 1, turnIndex: 1, type: 'USER_INPUT', createdAt: '2026-11-27T10:00:00Z', createdMs: 1700000000000, cleanText: 'go', rawText: 'go', tokensEst: 20, mediaTokensEst: 0 },
+        { stepIndex: 2, turnIndex: 1, type: 'PLANNER_RESPONSE', createdAt: '2026-11-27T10:00:05Z', createdMs: 1700000005000, model: 'gemini-4-neon-high', modelLabel: 'Gemini', contextWindow: 512000, maxOutput: 65536, inputTokens: 500, cacheReadTokens: 4500, outputTokens: 200, totalPromptTokens: 5000, totalBillableTokens: 5200, cost: 0.01, thinkingTokensEst: 0, answerTokensEst: 200, toolCallTokensEst: 0, toolCalls: [{ callIndex: 0, name: 'exit_plan_mode', args: {}, argsTokensEst: 10 }] },
+        { stepIndex: 3, turnIndex: 1, type: 'PLANNER_RESPONSE', createdAt: '2026-11-27T10:00:10Z', createdMs: 1700000010000, model: 'gemini-4-hydrogen-high', modelLabel: 'Gemini', contextWindow: 512000, maxOutput: 65536, inputTokens: 600, cacheReadTokens: 4400, outputTokens: 300, totalPromptTokens: 5000, totalBillableTokens: 5300, cost: 0.01, thinkingTokensEst: 0, answerTokensEst: 300, toolCallTokensEst: 0, toolCalls: [] },
+      ],
+    },
+    { title: 'handoff-regression' },
+    handoffOfficial
+  );
+  assert.equal(handoffAnalyzed.timeline.steps[0].callRole, 'orchestrator');
+  assert.equal(handoffAnalyzed.timeline.steps[1].callRole, 'executor');
+  console.log('[verify] Per-call telemetry diagnostics & attribution OK');
+
   const router = createRouter({ version: '0.1.0-test' });
   const server = await startStandaloneServer(router, { port: 0, host: '127.0.0.1' });
 
@@ -318,6 +451,15 @@ async function run() {
           console.log(`[verify] Second distinct session OK: id=${secondId.slice(0, 8)}, billable=${secondPayload.session.stats.tokens.billableTotal}`);
         }
       }
+      const callsAssetRes = await fetch(`${server.url}/js/views/calls.js`);
+      assert.equal(callsAssetRes.status, 200);
+      const firstCallSnap = s.timeline.steps[0];
+      assert.ok(firstCallSnap.actualModel, 'actualModel missing on timeline step');
+      assert.ok(['direct', 'orchestrator', 'executor'].includes(firstCallSnap.callRole));
+      assert.ok(['ok', 'retry', 'error'].includes(firstCallSnap.callStatus));
+      assert.ok(['warm', 'partial', 'cold', 'unknown'].includes(firstCallSnap.actual?.cacheStart));
+      assert.ok(Number.isFinite(firstCallSnap.actual?.thinkingPct));
+
       const comp = s.currentContext?.composition || {};
       const compKeys = ['systemBase', 'toolDefs', 'tools', 'user', 'injected', 'skills', 'assistant', 'thinking', 'media', 'other'];
       const compSum = compKeys.reduce((acc, key) => acc + (comp[key] || 0), 0);
@@ -327,13 +469,47 @@ async function run() {
 
       const stepRes = await fetch(`${server.url}/api/step?id=${encodeURIComponent(health.latestSessionId)}&baseline=prev_turn`);
       assert.equal(stepRes.status, 200);
-      const stepData = await stepRes.json();
+      const stepRawText = await stepRes.text();
+      assert.ok(stepRawText.length < 500 * 1024, `/api/step slim payload too large: ${stepRawText.length} bytes`);
+      const stepData = JSON.parse(stepRawText);
+      assert.ok(stepData.rev, '/api/step missing rev');
       assert.ok(Array.isArray(stepData.categories) && stepData.categories.length === 8);
       assert.ok(Array.isArray(stepData.dna?.ribbon));
       console.log(
         `[verify] Step Browser OK: seq=${stepData.seq}, categories=${stepData.categories.length}, ` +
-        `dnaItems=${stepData.dna.ribbon.length}`
+        `dnaItems=${stepData.dna.ribbon.length}, payloadKB=${(stepRawText.length / 1024).toFixed(1)}`
       );
+
+      // On-demand single item detail check (category item & DNA item)
+      const catItemWithDetail = stepData.categories.flatMap(c => c.items || []).find(it => it.hasDetail);
+      assert.ok(catItemWithDetail, 'expected at least one category item with detail');
+      const itemDetailRes = await fetch(`${server.url}/api/step?id=${encodeURIComponent(health.latestSessionId)}&step=${stepData.seq}&itemId=${encodeURIComponent(catItemWithDetail.id)}`);
+      assert.equal(itemDetailRes.status, 200);
+      const itemDetailJson = await itemDetailRes.json();
+      assert.ok(itemDetailJson.detail, 'on-demand category item detail missing');
+
+      const dnaItemWithDetail = (stepData.dna?.list || []).find(it => it.hasDetail && it.itemId);
+      assert.ok(dnaItemWithDetail, 'expected at least one DNA item with detail');
+      const dnaDetailRes = await fetch(`${server.url}/api/step?id=${encodeURIComponent(health.latestSessionId)}&step=${stepData.seq}&itemId=${encodeURIComponent(dnaItemWithDetail.itemId)}`);
+      assert.equal(dnaDetailRes.status, 200);
+      const dnaDetailJson = await dnaDetailRes.json();
+      assert.ok(dnaDetailJson.detail, 'on-demand DNA item detail missing');
+
+      // Backend full-text search & rev short-circuit checks
+      const stepSearchRes = await fetch(`${server.url}/api/step?id=${encodeURIComponent(health.latestSessionId)}&step=${stepData.seq}&q=antigravity`);
+      assert.equal(stepSearchRes.status, 200);
+      const stepSearchJson = await stepSearchRes.json();
+      assert.ok(Array.isArray(stepSearchJson.categories));
+
+      const stepUnchangedText = await (await fetch(`${server.url}/api/step?id=${encodeURIComponent(health.latestSessionId)}&step=${stepData.seq}&baseline=prev_turn&rev=${encodeURIComponent(stepData.rev)}`)).text();
+      assert.ok(stepUnchangedText.length < 160 && JSON.parse(stepUnchangedText).unchanged === true, '/api/step rev short-circuit failed');
+
+      const sessUnchangedText = await (await fetch(`${server.url}/api/session?id=${encodeURIComponent(health.latestSessionId)}&rev=${encodeURIComponent(sessPayload.rev)}`)).text();
+      assert.ok(sessUnchangedText.length < 200 && JSON.parse(sessUnchangedText).unchanged === true, '/api/session rev short-circuit failed');
+
+      const insUnchangedText = await (await fetch(`${server.url}/api/insights?range=30d&rev=${encodeURIComponent(insights.rev)}`)).text();
+      assert.ok(insUnchangedText.length < 160 && JSON.parse(insUnchangedText).unchanged === true, '/api/insights rev short-circuit failed');
+      console.log('[verify] On-demand detail, backend search & rev short-circuits OK');
 
       const fleetRes = await fetch(`${server.url}/api/fleet?id=${encodeURIComponent(health.latestSessionId)}`);
       assert.equal(fleetRes.status, 200);

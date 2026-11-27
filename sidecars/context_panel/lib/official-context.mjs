@@ -19,6 +19,38 @@ const NUMERIC_KEYS = new Set(['inputTokens', 'cacheReadTokens', 'cacheCreationTo
 
 export const MIN_STREAM_MS = 50;
 export const MIN_OUTPUT_TOKENS_FOR_SPEED = 2;
+export const COLD_START_THRESHOLD_PCT = 10;
+export const WARM_START_THRESHOLD_PCT = 70;
+export const SHORT_SAMPLE_MIN_STREAM_MS = 300;
+export const SHORT_SAMPLE_MIN_OUTPUT_TOKENS = 16;
+
+/**
+ * Classify prompt cache start efficiency from cacheHitRate (0..1) and totalPromptTokens.
+ */
+export function classifyCacheStart(cacheHitRate, totalPromptTokens) {
+  if (!Number.isFinite(totalPromptTokens) || totalPromptTokens <= 0) return 'unknown';
+  if (typeof cacheHitRate !== 'number' || !Number.isFinite(cacheHitRate) || cacheHitRate < 0) return 'unknown';
+  const pct = cacheHitRate * 100;
+  if (pct < COLD_START_THRESHOLD_PCT) return 'cold';
+  if (pct < WARM_START_THRESHOLD_PCT) return 'partial';
+  return 'warm';
+}
+
+/**
+ * Evaluate per-call decode throughput with sparse-sample micro-burst gating.
+ */
+export function evaluateCallSpeed(outputTokens, streamingMsExact) {
+  const out = Math.max(0, Number(outputTokens) || 0);
+  const streamMs = Number.isFinite(streamingMsExact) && streamingMsExact > 0 ? streamingMsExact : 0;
+  if (out <= 0 || streamMs <= 0) {
+    return { displaySpeed: null, rawSpeed: null, isShortSample: false };
+  }
+  const rawSpeed = Math.round((out / (streamMs / 1000)) * 10) / 10;
+  if (out < SHORT_SAMPLE_MIN_OUTPUT_TOKENS || streamMs < SHORT_SAMPLE_MIN_STREAM_MS) {
+    return { displaySpeed: null, rawSpeed, isShortSample: true };
+  }
+  return { displaySpeed: rawSpeed, rawSpeed, isShortSample: false };
+}
 
 function toInt(value) {
   if (typeof value === 'number') return Number.isFinite(value) ? Math.max(0, Math.round(value)) : 0;
@@ -315,6 +347,70 @@ function extractTimingTelemetry(entries) {
       latestOutputTokensPerSec,
     },
   };
+}
+
+/**
+ * Extract per-step full call telemetry (model, thinking/cache breakdown, TTFT, retries, errors).
+ */
+function extractCallTelemetry(entries) {
+  const byStep = new Map();
+
+  for (const entry of entries) {
+    const chatModel = entry?.chatModel;
+    if (!chatModel || typeof chatModel !== 'object') continue;
+    const usage = usageOf(chatModel);
+    const thinkingOutputTokens = usage.thinkingOutputTokens > 0
+      ? Math.min(usage.thinkingOutputTokens, usage.outputTokens > 0 ? usage.outputTokens : usage.thinkingOutputTokens)
+      : (usage.responseOutputTokens > 0 && usage.outputTokens > usage.responseOutputTokens
+          ? usage.outputTokens - usage.responseOutputTokens
+          : 0);
+
+    const streamingMsExact = parseDurationMs(chatModel.streamingDuration);
+    const ttftMsExact = parseDurationMs(chatModel.timeToFirstToken);
+    const ttftMs = ttftMsExact >= 1 ? Math.round(ttftMsExact) : 0;
+    const totalMs = Math.round(streamingMsExact + ttftMsExact);
+
+    const errorMessage = typeof entry.error === 'string' ? entry.error.trim() : '';
+    const hasError = Boolean(errorMessage);
+    const retryInfos = Array.isArray(chatModel.retryInfos) ? chatModel.retryInfos : [];
+    const retryErrCount = retryInfos.filter(
+      ri => ri && typeof ri === 'object' && typeof ri.error === 'string' && ri.error.trim()
+    ).length;
+    const cmRetries = toInt(chatModel.retries);
+    const retries = retryErrCount > 0
+      ? retryErrCount
+      : (retryInfos.length === 0 && cmRetries > 1 ? cmRetries - 1 : 0);
+
+    const record = {
+      model: String(chatModel.model || '').trim(),
+      responseModel: String(chatModel.responseModel || '').trim(),
+      modelDisplayName: String(chatModel.modelDisplayName || '').trim(),
+      executionModel: String(entry?.plannerConfig?.planExecuteConfig?.executionModel || '').trim(),
+      inputTokens: usage.inputTokens,
+      cacheReadTokens: usage.cacheReadTokens,
+      cacheCreationTokens: usage.cacheCreationTokens,
+      outputTokens: usage.outputTokens,
+      thinkingOutputTokens,
+      responseOutputTokens: usage.responseOutputTokens,
+      totalPromptTokens: usage.totalPromptTokens,
+      ttftMs,
+      streamingMs: Math.round(streamingMsExact),
+      streamingMsExact,
+      totalMs,
+      hasError,
+      errorMessage,
+      retries,
+    };
+
+    const stepIndices = Array.isArray(entry.stepIndices)
+      ? entry.stepIndices.map(toInt).filter(idx => idx >= 0)
+      : [];
+    for (const idx of stepIndices) {
+      byStep.set(idx, record);
+    }
+  }
+
+  return byStep;
 }
 
 function checkpointIndexOf(chatModel) {
@@ -687,6 +783,7 @@ export function parseOfficialContext(generatorMetadata, options = {}) {
     checkpointIndex: checkpointIndexOf(chatModel),
     checkpoints: detectCheckpoints(entries),
     timing: extractTimingTelemetry(entries),
+    callsByStep: extractCallTelemetry(entries),
     cache: extractCacheTelemetry(entries),
     buckets,
     fixed,

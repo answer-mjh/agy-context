@@ -2,12 +2,14 @@ import { existsSync, statSync } from 'node:fs';
 import { basename, extname, join } from 'node:path';
 import { isPathInside, resolveBrainDir } from './env.mjs';
 import { parseTranscriptFile, localPathFromUri } from './parser.mjs';
-import { getModelSpec } from './pricing.mjs';
+import { getModelSpec, estimateStepCost } from './pricing.mjs';
 import { getGeneratorMetadata } from './ls-rpc.mjs';
 import {
   MIN_OUTPUT_TOKENS_FOR_SPEED,
   MIN_STREAM_MS,
+  classifyCacheStart,
   estimateComposition,
+  evaluateCallSpeed,
   normalizeOutputRatios,
   officialCompositionWithSplit,
   officialFixedTotals,
@@ -15,6 +17,14 @@ import {
 } from './official-context.mjs';
 
 const MAX_LRU_SESSIONS = 4;
+const LEGACY_ORCHESTRATOR_PLANNER_IDS = new Set([
+  'MODEL_PLACEHOLDER_M537',
+  'MODEL_PLACEHOLDER_M667',
+  'MODEL_PLACEHOLDER_M681',
+]);
+const LEGACY_ORCHESTRATOR_EXECUTOR_IDS = new Set([
+  'MODEL_PLACEHOLDER_M669',
+]);
 
 function truncate(str, maxLen = 120) {
   if (!str || typeof str !== 'string') return '';
@@ -160,6 +170,7 @@ export function analyzeSession(convId, parsed, meta, official = null) {
   let prevStepType = '';
   let latestModel = '';
   let prevPromptTokens = 0;
+  let prevCallPromptTokens = null;
   let prevComp = null;
 
   const billableBuckets = {
@@ -542,7 +553,42 @@ export function analyzeSession(convId, parsed, meta, official = null) {
         }
       }
 
-      const reqCacheRate = s.totalPromptTokens > 0 ? s.cacheReadTokens / s.totalPromptTokens : 0;
+      const officialCall = official?.callsByStep?.get(s.stepIndex) || null;
+      const callInput = officialCall ? officialCall.inputTokens : s.inputTokens;
+      const callCacheRead = officialCall ? officialCall.cacheReadTokens : s.cacheReadTokens;
+      const callCacheCreation = officialCall ? officialCall.cacheCreationTokens : 0;
+      const callOutput = officialCall ? officialCall.outputTokens : s.outputTokens;
+      const callTotalPrompt = callInput + callCacheRead + callCacheCreation;
+      const reqCacheRate = callTotalPrompt > 0 ? callCacheRead / callTotalPrompt : 0;
+      const callCacheStart = classifyCacheStart(reqCacheRate, callTotalPrompt);
+      const callThinkingTokens = officialCall
+        ? officialCall.thinkingOutputTokens
+        : Math.min(s.outputTokens, s.thinkingTokensEst || 0);
+      const callThinkingPct = callOutput > 0 && callThinkingTokens > 0
+        ? Math.min(100, Math.round((callThinkingTokens / callOutput) * 100))
+        : 0;
+      const callCost = officialCall && callCacheCreation > 0
+        ? estimateStepCost(officialCall.responseModel || s.model, callInput + callCacheCreation, callCacheRead, callOutput).cost
+        : s.cost;
+      const callTtftMs = officialCall ? officialCall.ttftMs : stepTtftMs;
+      const callStreamExact = officialCall ? officialCall.streamingMsExact : stepStreamingExact;
+      const callTotalMs = officialCall && officialCall.totalMs > 0 ? officialCall.totalMs : modelDurMs;
+      const speedEval = evaluateCallSpeed(
+        callOutput,
+        callStreamExact > 0 ? callStreamExact : (officialCall ? 0 : callTotalMs)
+      );
+      const callStatus = officialCall?.hasError
+        ? 'error'
+        : (officialCall?.retries > 0 ? 'retry' : 'ok');
+
+      let netDeltaTokens = null;
+      if (callTotalPrompt > 0) {
+        if (prevCallPromptTokens !== null) {
+          netDeltaTokens = callTotalPrompt - prevCallPromptTokens;
+        }
+        prevCallPromptTokens = callTotalPrompt;
+      }
+      const isCompactionDrop = (netDeltaTokens !== null && netDeltaTokens <= -8000) || flags.includes('compaction');
 
       plannerSnapshots.push({
         seq: plannerSeq,
@@ -550,21 +596,39 @@ export function analyzeSession(convId, parsed, meta, official = null) {
         turnIndex: s.turnIndex,
         createdAt: s.createdAt,
         model: s.model,
+        actualModel: officialCall?.responseModel || s.model,
+        rawModelId: officialCall?.model || s.model,
+        executionModel: officialCall?.executionModel || '',
+        callRole: 'direct',
+        isColdCacheSwitch: false,
+        netDeltaTokens,
+        isCompactionDrop,
         modelLabel: s.modelLabel,
         contextWindow: s.contextWindow,
         maxOutput: s.maxOutput,
         durationMs: modelDurMs,
-        streamingMs: stepStreamingMs,
-        ttftMs: stepTtftMs,
+        callDurationMs: callTotalMs,
+        streamingMs: officialCall ? officialCall.streamingMs : stepStreamingMs,
+        ttftMs: callTtftMs,
         tokensPerSec: stepTps,
+        displayTokensPerSec: speedEval.displaySpeed,
+        rawTokensPerSec: speedEval.rawSpeed,
+        isShortSample: speedEval.isShortSample,
+        callStatus,
+        retries: officialCall?.retries || 0,
+        errorMessage: officialCall?.errorMessage || '',
         actual: {
-          inputTokens: s.inputTokens,
-          cacheReadTokens: s.cacheReadTokens,
-          outputTokens: s.outputTokens,
-          totalPromptTokens: s.totalPromptTokens,
-          totalBillableTokens: s.totalBillableTokens,
+          inputTokens: callInput,
+          cacheReadTokens: callCacheRead,
+          cacheCreationTokens: callCacheCreation,
+          outputTokens: callOutput,
+          thinkingOutputTokens: callThinkingTokens,
+          thinkingPct: callThinkingPct,
+          totalPromptTokens: callTotalPrompt || s.totalPromptTokens,
+          totalBillableTokens: callTotalPrompt + callOutput,
           cacheHitRate: reqCacheRate,
-          cost: s.cost,
+          cacheStart: callCacheStart,
+          cost: callCost,
         },
         composition,
         delta,
@@ -715,6 +779,114 @@ export function analyzeSession(convId, parsed, meta, official = null) {
 
       prevStepMs = s.createdMs || prevStepMs;
       prevStepType = s.type;
+    }
+  }
+
+  // Two-pass Orchestrator / Executor role attribution & cold-cache switch detection
+  if (plannerSnapshots.length > 0) {
+    const planIds = new Set();
+    const execIds = new Set();
+    let hasPlanHandoffTools = false;
+
+    const addModelKeys = (set, snap) => {
+      for (const k of [snap?.rawModelId, snap?.actualModel, snap?.model]) {
+        const clean = String(k || '').trim();
+        if (clean) set.add(clean);
+      }
+    };
+    const matchesSet = (set, snap) =>
+      [snap?.rawModelId, snap?.actualModel, snap?.model].some(k => {
+        const clean = String(k || '').trim();
+        return clean && set.has(clean);
+      });
+
+    for (let i = 0; i < plannerSnapshots.length; i++) {
+      const snap = plannerSnapshots[i];
+      const tools = snap.brief?.responseTools || [];
+      if (tools.includes('exit_plan_mode')) {
+        hasPlanHandoffTools = true;
+        addModelKeys(planIds, snap);
+        if (i + 1 < plannerSnapshots.length && plannerSnapshots[i + 1].turnIndex === snap.turnIndex) {
+          addModelKeys(execIds, plannerSnapshots[i + 1]);
+        }
+      }
+      if (tools.includes('enter_plan_mode')) {
+        hasPlanHandoffTools = true;
+        addModelKeys(execIds, snap);
+        if (i + 1 < plannerSnapshots.length && plannerSnapshots[i + 1].turnIndex === snap.turnIndex) {
+          addModelKeys(planIds, plannerSnapshots[i + 1]);
+        }
+      }
+      if (snap.executionModel) {
+        execIds.add(snap.executionModel);
+        if (snap.rawModelId && snap.rawModelId !== snap.executionModel) {
+          addModelKeys(planIds, snap);
+        }
+      }
+      if (LEGACY_ORCHESTRATOR_PLANNER_IDS.has(snap.rawModelId)) {
+        addModelKeys(planIds, snap);
+      }
+      if (LEGACY_ORCHESTRATOR_EXECUTOR_IDS.has(snap.rawModelId)) {
+        addModelKeys(execIds, snap);
+      }
+    }
+
+    const hasPlanExecute = planIds.size > 0 || execIds.size > 0 || hasPlanHandoffTools;
+    if (hasPlanExecute) {
+      let phase = 'orchestrator';
+      let prevTurnIndex = null;
+      let prevRole = null;
+
+      for (let i = 0; i < plannerSnapshots.length; i++) {
+        const snap = plannerSnapshots[i];
+        if (prevTurnIndex !== null && snap.turnIndex !== prevTurnIndex) {
+          phase = 'orchestrator';
+        }
+        const tools = snap.brief?.responseTools || [];
+        const inPlan = matchesSet(planIds, snap);
+        const inExec = matchesSet(execIds, snap);
+
+        let role = 'direct';
+        if (LEGACY_ORCHESTRATOR_PLANNER_IDS.has(snap.rawModelId)) {
+          role = 'orchestrator';
+        } else if (LEGACY_ORCHESTRATOR_EXECUTOR_IDS.has(snap.rawModelId)) {
+          role = 'executor';
+        } else if (tools.includes('exit_plan_mode')) {
+          role = 'orchestrator';
+        } else if (tools.includes('enter_plan_mode')) {
+          role = 'executor';
+        } else if (inExec && !inPlan) {
+          role = 'executor';
+        } else if (inPlan && !inExec) {
+          role = 'orchestrator';
+        } else if (snap.rawModelId && snap.executionModel && snap.rawModelId !== snap.executionModel) {
+          role = 'orchestrator';
+        } else if (hasPlanHandoffTools) {
+          role = phase;
+        } else if (execIds.size > 0 && snap.rawModelId && !inExec) {
+          role = 'orchestrator';
+        }
+
+        snap.callRole = role;
+        if (
+          prevRole !== null &&
+          prevRole !== role &&
+          ((prevRole === 'orchestrator' && role === 'executor') ||
+            (prevRole === 'executor' && role === 'orchestrator')) &&
+          (snap.actual?.cacheReadTokens || 0) === 0 &&
+          (snap.actual?.totalPromptTokens || 0) > 0
+        ) {
+          snap.isColdCacheSwitch = true;
+        }
+
+        if (tools.includes('exit_plan_mode')) {
+          phase = 'executor';
+        } else if (tools.includes('enter_plan_mode')) {
+          phase = 'orchestrator';
+        }
+        prevTurnIndex = snap.turnIndex;
+        prevRole = role;
+      }
     }
   }
 
@@ -1261,9 +1433,11 @@ export class SessionDetailStore {
       selectedSeq >= 0 && selectedSeq < steps.length
         ? selectedSeq
         : steps.length - 1;
+    const rev = `${session.mtimeMs}:${session.size}:${activeSeq}:${session.stats.context.requests}:${session.currentContext.actual?.totalPromptTokens || 0}:${session.currentContext.composition?.total || 0}`;
 
     return {
       id: session.id,
+      rev,
       isFullTranscript: session.isFullTranscript,
       meta: session.meta,
       stats: session.stats,
@@ -1276,12 +1450,24 @@ export class SessionDetailStore {
           turnIndex: s.turnIndex,
           createdAt: s.createdAt,
           model: s.model,
+          actualModel: s.actualModel || s.model,
+          callRole: s.callRole || 'direct',
+          isColdCacheSwitch: Boolean(s.isColdCacheSwitch),
+          netDeltaTokens: s.netDeltaTokens ?? null,
+          isCompactionDrop: Boolean(s.isCompactionDrop),
           modelLabel: s.modelLabel,
           contextWindow: s.contextWindow,
           durationMs: s.durationMs,
+          callDurationMs: s.callDurationMs || s.durationMs || 0,
           streamingMs: s.streamingMs || 0,
           ttftMs: s.ttftMs || 0,
           tokensPerSec: s.tokensPerSec || 0,
+          displayTokensPerSec: s.displayTokensPerSec ?? null,
+          rawTokensPerSec: s.rawTokensPerSec ?? null,
+          isShortSample: Boolean(s.isShortSample),
+          callStatus: s.callStatus || 'ok',
+          retries: s.retries || 0,
+          errorMessage: s.errorMessage || '',
           actual: s.actual,
           composition: s.composition,
           delta: s.delta,
@@ -1300,13 +1486,18 @@ export class SessionDetailStore {
     const session = await this.load(convId, meta, options);
     if (!session) return null;
 
+    const itemIdParam = typeof options?.itemId === 'string' ? options.itemId.trim() : '';
+    const searchQ = typeof options?.q === 'string' ? options.q.trim().toLowerCase() : '';
     const steps = session.timeline.steps;
-    const isLatest = seqParam < 0 || seqParam >= steps.length;
+    const isLatest = steps.length === 0
+      ? seqParam < 0
+      : (seqParam < 0 || seqParam >= steps.length - 1);
     const targetSeq = steps.length > 0 ? (isLatest ? steps.length - 1 : seqParam) : -1;
     const snap = targetSeq >= 0 ? steps[targetSeq] : null;
     const officialFull = isLatest ? session._officialFull : null;
     const hasOfficialFixed = Boolean(officialFull?.hasBreakdown);
     const isPostCompactLatest = isLatest && Boolean(session._compactedAfterLatestPlanner);
+    const detailById = new Map();
 
     // Only show items belonging to the snapshot's history epoch. A compaction
     // starts a new epoch, so pre-compaction items stay viewable on old steps
@@ -1345,7 +1536,61 @@ export class SessionDetailStore {
           .filter(item => (item.epoch ?? 0) === baseEpoch)
       : [];
 
-    const groupItems = (list, estBaseTokens, includeOfficialFixed = false) => {
+    const toSlimCategoryItem = (it, hasDetail) => {
+      const out = {
+        id: it.id,
+        title: it.title,
+        tokens: it.tokens || 0,
+        stepIndex: it.stepIndex ?? 0,
+        turnIndex: it.turnIndex ?? 0,
+        hasDetail: Boolean(hasDetail),
+      };
+      if (it.createdAt) out.createdAt = it.createdAt;
+      if (it.source) out.source = it.source;
+      if (it.officialContext) out.officialContext = true;
+      if (it.estimated) out.estimated = true;
+      if (it.kind) out.kind = it.kind;
+      if (it.toolName) out.toolName = it.toolName;
+      if (it.skillName) out.skillName = it.skillName;
+      if (it.isError) out.isError = true;
+      if (it.lineCount) out.lineCount = it.lineCount;
+      if (it.durationMs) out.durationMs = it.durationMs;
+      if (it.exitCode !== null && it.exitCode !== undefined) out.exitCode = it.exitCode;
+      if (it.hasThinking) out.hasThinking = true;
+      if (it.hasAnswer) out.hasAnswer = true;
+      if (it.hasTools) out.hasTools = true;
+      if (it.thinkingTokens) out.thinkingTokens = it.thinkingTokens;
+      if (it.answerTokens) out.answerTokens = it.answerTokens;
+      if (it.toolCallTokens) out.toolCallTokens = it.toolCallTokens;
+      if (it.mimeType) out.mimeType = it.mimeType;
+      if (it.ext) out.ext = it.ext;
+      if (it.fileSize) out.fileSize = it.fileSize;
+      if (it.attachmentUrl) out.attachmentUrl = it.attachmentUrl;
+      return out;
+    };
+
+    const itemMatchesQuery = (it, detail, qLower) => {
+      if (!qLower) return true;
+      const hay = [
+        it?.title,
+        it?.toolName,
+        it?.skillName,
+        it?.category,
+        detail?.body,
+        detail?.rawBody,
+        detail?.answer,
+        detail?.thinking,
+      ].filter(Boolean).join(' ').toLowerCase();
+      return hay.includes(qLower);
+    };
+
+    const groupItems = (list, estBaseTokens, includeOfficialFixed = false, captureDetails = false) => {
+      const sysBody =
+        'Antigravity does not persist the built-in system prompt text or native tool JSON schemas inside transcript.jsonl. ' +
+        'This value is derived as max(0, actual_prompt_tokens - estimated_visible_history_tokens).';
+      if (captureDetails && estBaseTokens > 0) {
+        detailById.set('system-base', { body: sysBody });
+      }
       const groups = {
         system_base: {
           key: 'system_base',
@@ -1357,9 +1602,6 @@ export class SessionDetailStore {
                 tokens: estBaseTokens,
                 stepIndex: 0,
                 estimated: true,
-                body:
-                  'Antigravity does not persist the built-in system prompt text or native tool JSON schemas inside transcript.jsonl. ' +
-                  'This value is derived as max(0, actual_prompt_tokens - estimated_visible_history_tokens).',
               }]
             : [],
         },
@@ -1386,14 +1628,19 @@ export class SessionDetailStore {
           const bucket = groups[category];
           if (!bucket) continue;
           bucket.tokens += section.tokens;
+          const id = `section-${index}-${category}`;
+          const source = officialSectionSource(section);
+          const body = section.content || '(官方未返回正文)';
+          if (captureDetails) {
+            detailById.set(id, { body, source });
+          }
           bucket.items.push({
-            id: `section-${index}-${category}`,
+            id,
             title: section.title || `Section ${index + 1}`,
             tokens: section.tokens,
             stepIndex: snap?.stepIndex ?? 0,
             turnIndex: snap?.turnIndex ?? 0,
-            body: section.content || '(官方未返回正文)',
-            source: officialSectionSource(section),
+            source,
             officialContext: true,
             estimated: Boolean(section.estimated),
           });
@@ -1405,14 +1652,19 @@ export class SessionDetailStore {
           const tool = tools[index];
           if (!tool || !tool.tokens) continue;
           groups.tool_defs.tokens += tool.tokens;
+          const id = `tool-def-${index}-${tool.name}`;
+          const source = officialToolSource(tool.name);
+          const body = toolDefinitionBody(tool);
+          if (captureDetails) {
+            detailById.set(id, { body, source });
+          }
           groups.tool_defs.items.push({
-            id: `tool-def-${index}-${tool.name}`,
+            id,
             title: tool.name || `Tool ${index + 1}`,
             tokens: tool.tokens,
             stepIndex: snap?.stepIndex ?? 0,
             turnIndex: snap?.turnIndex ?? 0,
-            body: toolDefinitionBody(tool),
-            source: officialToolSource(tool.name),
+            source,
             officialContext: true,
             estimated: Boolean(tool.estimated),
           });
@@ -1433,6 +1685,7 @@ export class SessionDetailStore {
           const relPath = safePreview ? it.uri.slice(convDir.length).replace(/^[\\/]+/, '').replace(/\\/g, '/') : '';
           bucket.items.push({
             id: `media-${i}`,
+            kind: 'media',
             title: it.title,
             tokens: it.tokens,
             stepIndex: it.stepIndex,
@@ -1444,8 +1697,23 @@ export class SessionDetailStore {
             attachmentUrl: relPath ? `/api/attachment?id=${encodeURIComponent(convId)}&path=${encodeURIComponent(relPath)}` : '',
           });
         } else {
+          const id = `${it.kind}-${it.stepIndex}-${i}`;
+          if (captureDetails) {
+            detailById.set(id, {
+              body: it.body || '',
+              rawBody: it.rawBody || '',
+              thinking: it.thinking || '',
+              answer: it.answer || '',
+              toolArgs: it.toolArgs || null,
+              toolCalls: it.toolCalls || null,
+              toolName: it.toolName || '',
+              lineCount: it.lineCount || 0,
+              durationMs: it.durationMs || 0,
+              exitCode: it.exitCode ?? null,
+            });
+          }
           bucket.items.push({
-            id: `${it.kind}-${it.stepIndex}-${i}`,
+            id,
             ...it,
           });
         }
@@ -1453,15 +1721,29 @@ export class SessionDetailStore {
       return groups;
     };
 
-    const currentGroups = groupItems(items, snap ? snap.estimatedBaseTokens : 0, hasOfficialFixed);
-    const baseGroups = baseSnap ? groupItems(baseItems, baseSnap.estimatedBaseTokens) : null;
+    const currentGroups = groupItems(items, snap ? snap.estimatedBaseTokens : 0, hasOfficialFixed, true);
+    if (itemIdParam) {
+      return {
+        id: convId,
+        seq: targetSeq,
+        itemId: itemIdParam,
+        detail: detailById.get(itemIdParam) || null,
+      };
+    }
+
+    const baseGroups = baseSnap ? groupItems(baseItems, baseSnap.estimatedBaseTokens, false, false) : null;
 
     const categories = Object.values(currentGroups).map(cat => {
       const prevCat = baseGroups ? baseGroups[cat.key] : null;
       const suppressFixedDelta = hasOfficialFixed && (cat.key === 'system_base' || cat.key === 'tool_defs');
+      const matchedItems = searchQ
+        ? cat.items.filter(it => itemMatchesQuery(it, detailById.get(it.id), searchQ))
+        : cat.items;
       return {
-        ...cat,
-        count: cat.items.length,
+        key: cat.key,
+        tokens: cat.tokens,
+        items: matchedItems.map(it => toSlimCategoryItem(it, detailById.has(it.id))),
+        count: matchedItems.length,
         deltaItems: prevCat && !suppressFixedDelta ? cat.items.length - prevCat.items.length : null,
         deltaTokens: prevCat && !suppressFixedDelta ? cat.tokens - prevCat.tokens : null,
       };
@@ -1476,12 +1758,12 @@ export class SessionDetailStore {
           if (!item.officialContext) continue;
           dnaRibbon.push({
             pos: dnaRibbon.length,
+            itemId: item.id,
             category: key,
             title: item.title,
             stepIndex: item.stepIndex,
             turnIndex: item.turnIndex,
             tokens: item.tokens || 0,
-            body: item.body || '',
             source: item.source || '',
           });
         }
@@ -1489,17 +1771,19 @@ export class SessionDetailStore {
     } else if (snap && snap.estimatedBaseTokens > 0) {
       dnaRibbon.push({
         pos: 0,
+        itemId: 'system-base',
         category: 'system_base',
         title: 'System & Tool Schemas (Estimated)',
         stepIndex: 0,
         tokens: snap.estimatedBaseTokens,
-        body: currentGroups.system_base.items[0]?.body || '',
       });
     }
     for (let i = 0; i < items.length; i++) {
       const it = items[i];
+      const itemId = it.kind === 'media' ? `media-${i}` : `${it.kind}-${it.stepIndex}-${i}`;
       dnaRibbon.push({
         pos: dnaRibbon.length,
+        itemId,
         category: it.kind,
         title: it.title,
         stepIndex: it.stepIndex,
@@ -1507,15 +1791,17 @@ export class SessionDetailStore {
         tokens: it.tokens || 0,
         isError: Boolean(it.isError),
         toolName: it.toolName || '',
-        body: it.body || it.answer || it.thinking || '',
-        thinking: it.thinking || '',
-        toolCalls: it.toolCalls || null,
-        toolArgs: it.toolArgs || null,
       });
     }
 
+    const filteredDnaRibbon = searchQ
+      ? dnaRibbon.filter(d => itemMatchesQuery(d, detailById.get(d.itemId), searchQ))
+      : dnaRibbon;
+    const rev = `${session.mtimeMs}:${session.size}:${targetSeq}:${baseline}:${isPostCompactLatest ? 1 : 0}:${officialFull?.usedTokens || 0}`;
+
     return {
       id: convId,
+      rev,
       seq: targetSeq,
       isLatest,
       stepIndex: snap ? snap.stepIndex : -1,
@@ -1531,14 +1817,26 @@ export class SessionDetailStore {
       categories,
       dna: {
         totalTokens: dnaRibbon.reduce((acc, x) => acc + x.tokens, 0),
-        ribbon: dnaRibbon.map(d => ({
+        ribbon: filteredDnaRibbon.map(d => ({
           pos: d.pos,
           category: d.category,
           title: d.title,
           stepIndex: d.stepIndex,
           tokens: d.tokens,
         })),
-        list: dnaRibbon.slice().reverse(),
+        list: filteredDnaRibbon.slice().reverse().map(d => ({
+          pos: d.pos,
+          itemId: d.itemId,
+          category: d.category,
+          title: d.title,
+          stepIndex: d.stepIndex,
+          turnIndex: d.turnIndex,
+          tokens: d.tokens || 0,
+          ...(d.isError ? { isError: true } : {}),
+          ...(d.toolName ? { toolName: d.toolName } : {}),
+          ...(d.source ? { source: d.source } : {}),
+          hasDetail: detailById.has(d.itemId),
+        })),
       },
     };
   }

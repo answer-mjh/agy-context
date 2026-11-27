@@ -32,18 +32,35 @@
     const { t, fmtTokens, fmtDuration, fmtBytes, escHtml, renderSimpleMarkdown } = AGY.i18n;
     const viewMode = state.viewMode || 'categories';
     const baseline = state.baseline || 'prev_turn';
-    const search = (state.search || '').trim().toLowerCase();
     const assistantKind = state.assistantKind || ''; // '', 'thinking', 'tools', 'answer'
     const openCats = state.openCats || new Set(['user', 'assistant', 'tool_results']);
     const openItems = state.openItems || new Set();
     const rawItems = state.rawItems || new Set();
     const catSort = state.catSort || {};
 
+    if (!stepData) {
+      container.innerHTML = `<div class="card"><div class="empty-state">${escHtml(t('loading'))}</div></div>`;
+      return;
+    }
+
+    const itemById = new Map();
+    const categoryByKey = new Map();
     const toolCallCounts = new Map();
-    const toolResultsCat = (stepData?.categories || []).find(c => c.key === 'tool_results');
-    for (const item of toolResultsCat?.items || []) {
-      const name = item.toolName || item.title;
-      if (name) toolCallCounts.set(name, (toolCallCounts.get(name) || 0) + 1);
+    for (const cat of stepData.categories || []) {
+      categoryByKey.set(cat.key, cat);
+      for (const it of cat.items || []) {
+        itemById.set(it.id, { catKey: cat.key, item: it });
+        if (cat.key === 'tool_results') {
+          const name = it.toolName || it.title;
+          if (name) toolCallCounts.set(name, (toolCallCounts.get(name) || 0) + 1);
+        }
+      }
+    }
+    for (const d of stepData.dna?.list || []) {
+      const targetId = d.itemId || '';
+      if (targetId && !itemById.has(targetId)) {
+        itemById.set(targetId, { catKey: d.category, item: d });
+      }
     }
 
     function sortItems(items, mode) {
@@ -64,7 +81,7 @@
       return arr;
     }
 
-    function renderSortSelect(catKey) {
+    function renderSortSelect(catKey, isHidden = false) {
       const current = catSort[catKey] || 'order';
       const opts = [
         ['order', t('browserSortOrder')],
@@ -73,14 +90,281 @@
         ['title', t('browserSortName')],
         ['step', t('browserSortStep')],
       ];
-      return `<select class="select br-cat-sort" data-cat-sort="${escHtml(catKey)}" title="${escHtml(t('browserSortTip'))}" aria-label="${escHtml(t('browserSort'))}">
+      return `<select class="select br-cat-sort" data-cat-sort="${escHtml(catKey)}" title="${escHtml(t('browserSortTip'))}" aria-label="${escHtml(t('browserSort'))}"${isHidden ? ' hidden' : ''}>
         ${opts.map(([value, label]) => `<option value="${value}" ${current === value ? 'selected' : ''}>${escHtml(label)}</option>`).join('')}
       </select>`;
     }
 
-    if (!stepData) {
-      container.innerHTML = `<div class="card"><div class="empty-state">${escHtml(t('loading'))}</div></div>`;
-      return;
+    function getCopyText(itemId, field) {
+      const detail = callbacks?.getCachedDetail?.(itemId) || null;
+      const meta = itemById.get(itemId)?.item || null;
+      if (!detail && !meta) return '';
+      if (field === 'answer') return detail?.answer || '';
+      if (field === 'dna') return detail?.body || detail?.answer || detail?.thinking || '';
+      return detail?.body || detail?.rawBody || detail?.answer || detail?.thinking || '';
+    }
+
+    function renderItemDetailHtml(catKey, it, detail, isRaw, toggleKey, itemId, isDnaMode = false) {
+      if (!detail) {
+        return `<div class="browser-item-detail"><span class="card-subtitle">${escHtml(t('loading'))}</span></div>`;
+      }
+
+      if (isDnaMode) {
+        const cm = CAT_LABELS[it.category || catKey] || { i18n: 'catTools' };
+        const copyTxt = detail.body || detail.answer || detail.thinking || '';
+        return `
+          <div class="browser-item-detail">
+            <div class="filter-bar" style="justify-content:space-between">
+              <span class="pill">${escHtml(t(cm.i18n))}</span>
+              ${copyTxt ? `<button class="btn btn-sm" data-copy-item="${escHtml(itemId)}" data-copy-field="dna">${escHtml(t('copy'))}</button>` : ''}
+            </div>
+            ${detail.toolArgs ? `<pre class="code-block">${escHtml(JSON.stringify(detail.toolArgs, null, 2))}</pre>` : ''}
+            ${detail.toolCalls && detail.toolCalls.length > 0 ? `<pre class="code-block">${escHtml(JSON.stringify(detail.toolCalls, null, 2))}</pre>` : ''}
+            ${detail.thinking ? `<pre class="code-block">${escHtml(detail.thinking)}</pre>` : ''}
+            ${detail.body ? `<pre class="code-block">${escHtml(detail.body)}</pre>` : ''}
+            ${!detail.body && detail.answer ? `<pre class="code-block">${escHtml(detail.answer)}</pre>` : ''}
+          </div>
+        `;
+      }
+
+      if (catKey === 'assistant') {
+        const parts = [];
+        if (detail.thinking) {
+          parts.push(`<div><div class="card-subtitle" style="margin-bottom:4px">Thinking (~${escHtml(fmtTokens(it.thinkingTokens || 0))})</div><pre class="code-block">${escHtml(detail.thinking)}</pre></div>`);
+        }
+        if (detail.toolCalls && detail.toolCalls.length > 0) {
+          parts.push(`<div><div class="card-subtitle" style="margin-bottom:4px">Tool Calls (${detail.toolCalls.length})</div><pre class="code-block">${escHtml(JSON.stringify(detail.toolCalls, null, 2))}</pre></div>`);
+        }
+        if (detail.answer) {
+          parts.push(`
+            <div>
+              <div class="filter-bar" style="justify-content:space-between;margin-bottom:4px">
+                <span class="card-subtitle">Answer (~${escHtml(fmtTokens(it.answerTokens || 0))})</span>
+                <div class="filter-bar">
+                  <button class="btn btn-sm" data-toggle-raw="${escHtml(toggleKey)}" data-raw-item-id="${escHtml(itemId)}" data-raw-cat="${escHtml(catKey)}">${escHtml(isRaw ? t('mdView') : t('rawView'))}</button>
+                  <button class="btn btn-sm" data-copy-item="${escHtml(itemId)}" data-copy-field="answer">${escHtml(t('copy'))}</button>
+                </div>
+              </div>
+              ${isRaw
+                ? `<pre class="code-block">${escHtml(detail.answer)}</pre>`
+                : `<div class="md-rendered">${renderSimpleMarkdown(detail.answer)}</div>`
+              }
+            </div>
+          `);
+        }
+        return `<div class="browser-item-detail">${parts.join('') || '<span class="card-subtitle">—</span>'}</div>`;
+      }
+
+      if (catKey === 'tool_results' || catKey === 'skills') {
+        const bodyText = detail.body || detail.rawBody || '';
+        const lineCount = detail.lineCount || it.lineCount || 0;
+        const durationMs = detail.durationMs || it.durationMs || 0;
+        const exitCode = detail.exitCode !== null && detail.exitCode !== undefined ? detail.exitCode : it.exitCode;
+        return `
+          <div class="browser-item-detail">
+            <div class="filter-bar" style="justify-content:space-between">
+              <div class="filter-bar">
+                <span class="pill mono">${escHtml(detail.toolName || it.toolName || 'tool')}</span>
+                ${lineCount ? `<span class="pill mono">${lineCount} ${escHtml(t('linesUnit'))}</span>` : ''}
+                ${durationMs ? `<span class="pill mono">${escHtml(fmtDuration(durationMs))}</span>` : ''}
+                ${exitCode !== null && exitCode !== undefined ? `<span class="pill mono">exit ${exitCode}</span>` : ''}
+              </div>
+              <div class="filter-bar">
+                <button class="btn btn-sm" data-toggle-raw="${escHtml(toggleKey)}" data-raw-item-id="${escHtml(itemId)}" data-raw-cat="${escHtml(catKey)}">${escHtml(isRaw ? t('mdView') : t('rawView'))}</button>
+                <button class="btn btn-sm" data-copy-item="${escHtml(itemId)}" data-copy-field="body">${escHtml(t('copy'))}</button>
+              </div>
+            </div>
+            ${detail.toolArgs && Object.keys(detail.toolArgs).length > 0 ? `<pre class="code-block" style="max-height:140px">${escHtml(JSON.stringify(detail.toolArgs, null, 2))}</pre>` : ''}
+            ${isRaw
+              ? `<pre class="code-block">${escHtml(bodyText)}</pre>`
+              : `<div class="md-rendered">${renderSimpleMarkdown(bodyText)}</div>`
+            }
+          </div>
+        `;
+      }
+
+      const content = detail.body || detail.rawBody || '';
+      return `
+        <div class="browser-item-detail">
+          <div class="filter-bar" style="justify-content:flex-end">
+            <button class="btn btn-sm" data-copy-item="${escHtml(itemId)}" data-copy-field="body">${escHtml(t('copy'))}</button>
+          </div>
+          <pre class="code-block">${escHtml(content)}</pre>
+        </div>
+      `;
+    }
+
+    function bindDetailControls(scope) {
+      scope.querySelectorAll('[data-toggle-raw]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const toggleKey = btn.getAttribute('data-toggle-raw');
+          const itemId = btn.getAttribute('data-raw-item-id') || toggleKey;
+          const catKey = btn.getAttribute('data-raw-cat') || 'tool_results';
+          const rowEl = btn.closest('.browser-item');
+          const isDna = Boolean(rowEl?.hasAttribute('data-dna-row'));
+          const nextRaw = !rawItems.has(toggleKey);
+          callbacks?.onToggleRaw?.(toggleKey, { silent: true });
+          const metaItem = itemById.get(itemId)?.item || {};
+          const detail = callbacks?.getCachedDetail?.(itemId) || null;
+          if (!rowEl || !detail) return;
+          const oldDetail = rowEl.querySelector('.browser-item-detail');
+          if (oldDetail) oldDetail.remove();
+          rowEl.insertAdjacentHTML('beforeend', renderItemDetailHtml(catKey, metaItem, detail, nextRaw, toggleKey, itemId, isDna));
+          const newDetail = rowEl.querySelector('.browser-item-detail');
+          if (newDetail) bindDetailControls(newDetail);
+        });
+      });
+
+      scope.querySelectorAll('[data-copy-item]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          const itemId = btn.getAttribute('data-copy-item') || '';
+          const field = btn.getAttribute('data-copy-field') || 'body';
+          const txt = getCopyText(itemId, field);
+          const ok = await AGY.bridge.copyText(txt);
+          if (ok) {
+            const orig = btn.textContent;
+            btn.textContent = t('copied');
+            setTimeout(() => { btn.textContent = orig; }, 1200);
+          }
+        });
+      });
+    }
+
+    async function hydrateItemDetail(rowEl, itemId, catKey, toggleKey, isDna) {
+      const detail = await callbacks?.onLoadItemDetail?.(itemId);
+      if (!rowEl || !rowEl.isConnected || !openItems.has(toggleKey)) return;
+      const metaItem = itemById.get(itemId)?.item || {};
+      const oldDetail = rowEl.querySelector('.browser-item-detail');
+      if (oldDetail) oldDetail.remove();
+      rowEl.insertAdjacentHTML(
+        'beforeend',
+        detail
+          ? renderItemDetailHtml(catKey, metaItem, detail, rawItems.has(toggleKey), toggleKey, itemId, isDna)
+          : `<div class="browser-item-detail"><span class="card-subtitle">—</span></div>`
+      );
+      const newDetail = rowEl.querySelector('.browser-item-detail');
+      if (newDetail) bindDetailControls(newDetail);
+    }
+
+    function bindItemHeaders(scope) {
+      scope.querySelectorAll('[data-toggle-item]').forEach(head => {
+        head.addEventListener('click', () => {
+          const toggleKey = head.getAttribute('data-toggle-item');
+          const itemId = head.getAttribute('data-item-id') || toggleKey;
+          const catKey = head.getAttribute('data-cat-key') || 'other';
+          const rowEl = head.closest('.browser-item');
+          const chev = head.querySelector('[data-item-chev]');
+          const isDna = Boolean(rowEl?.hasAttribute('data-dna-row'));
+          const willOpen = !openItems.has(toggleKey);
+
+          callbacks?.onToggleItem?.(toggleKey, { silent: true });
+          if (chev) chev.textContent = willOpen ? '▾' : '▸';
+          if (!rowEl) return;
+
+          const existing = rowEl.querySelector('.browser-item-detail');
+          if (!willOpen) {
+            if (existing) existing.remove();
+            return;
+          }
+
+          const cachedDetail = callbacks?.getCachedDetail?.(itemId) || null;
+          if (existing) existing.remove();
+          const metaItem = itemById.get(itemId)?.item || {};
+          rowEl.insertAdjacentHTML(
+            'beforeend',
+            renderItemDetailHtml(catKey, metaItem, cachedDetail, rawItems.has(toggleKey), toggleKey, itemId, isDna)
+          );
+          if (cachedDetail) {
+            const newDetail = rowEl.querySelector('.browser-item-detail');
+            if (newDetail) bindDetailControls(newDetail);
+          } else {
+            void hydrateItemDetail(rowEl, itemId, catKey, toggleKey, isDna);
+          }
+        });
+      });
+    }
+
+    function computeVisibleCatItems(cat) {
+      let visibleItems = cat.items || [];
+      let kindCounts = null;
+      if (cat.key === 'assistant') {
+        kindCounts = {
+          thinking: visibleItems.filter(x => x.hasThinking).length,
+          tools: visibleItems.filter(x => x.hasTools).length,
+          answer: visibleItems.filter(x => x.hasAnswer).length,
+        };
+        if (assistantKind) {
+          visibleItems = visibleItems.filter(x =>
+            (assistantKind === 'thinking' && x.hasThinking) ||
+            (assistantKind === 'tools' && x.hasTools) ||
+            (assistantKind === 'answer' && x.hasAnswer)
+          );
+        }
+      }
+      visibleItems = sortItems(visibleItems, catSort[cat.key] || 'order');
+      return { visibleItems, kindCounts };
+    }
+
+    function renderCategoryBodyHtml(cat, visibleItems, kindCounts, pendingHydrations) {
+      return `
+        <div class="cat-body">
+          ${cat.key === 'assistant' && kindCounts ? `
+            <div class="filter-bar" style="margin-bottom:2px">
+              ${['thinking', 'tools', 'answer'].map(k => {
+                const labelKey = k === 'thinking' ? 'filterThinking' : k === 'tools' ? 'filterTools' : 'filterAnswer';
+                return `<button class="pill pill-btn ${assistantKind === k ? 'active' : ''}" data-akind="${k}">${escHtml(t(labelKey))} (${kindCounts[k]})</button>`;
+              }).join('')}
+            </div>
+          ` : ''}
+
+          ${cat.key === 'media'
+            ? (visibleItems.length > 0
+                ? `<div class="media-grid">${visibleItems.map(m => `
+                    <div class="media-card">
+                      ${m.attachmentUrl ? `<img class="media-thumb" src="${escHtml(m.attachmentUrl)}" alt="${escHtml(m.title)}" loading="lazy"/>` : `<div class="media-thumb" style="display:flex;align-items:center;justify-content:center;color:var(--ink-muted)">${escHtml(m.ext || 'FILE')}</div>`}
+                      <div class="media-meta">
+                        <div style="font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml(m.title)}">${escHtml(m.title)}</div>
+                        <div class="mono" style="color:var(--ink-muted)">${escHtml(fmtBytes(m.fileSize))} · ~${escHtml(fmtTokens(m.tokens))} tok</div>
+                      </div>
+                    </div>
+                  `).join('')}</div>`
+                : `<div class="card-subtitle" style="padding:6px">0</div>`)
+            : visibleItems.map(it => {
+                const isItemOpen = openItems.has(it.id);
+                const isRaw = rawItems.has(it.id);
+                const cachedDetail = isItemOpen ? (callbacks?.getCachedDetail?.(it.id) || null) : null;
+                if (isItemOpen && !cachedDetail && pendingHydrations) {
+                  pendingHydrations.push({ toggleKey: it.id, itemId: it.id, catKey: cat.key, isDna: false });
+                }
+                const statusPill = cat.key === 'tool_results'
+                  ? `<span class="pill ${it.isError ? 'pill-danger' : 'pill-good'}" style="font-size:10px">${it.isError ? 'ERR' : 'OK'}</span>`
+                  : '';
+                return `
+                  <div class="browser-item" data-step-idx="${it.stepIndex ?? ''}" data-item-row="${escHtml(it.id)}">
+                    <div class="browser-item-head" data-toggle-item="${escHtml(it.id)}" data-item-id="${escHtml(it.id)}" data-cat-key="${escHtml(cat.key)}">
+                      <span data-item-chev style="color:var(--ink-muted);font-size:10px">${isItemOpen ? '▾' : '▸'}</span>
+                      ${statusPill}
+                      <span class="browser-item-title ${cat.key === 'tool_results' || cat.key === 'tool_defs' ? 'mono' : ''}">${escHtml(it.title || it.toolName || 'Item')}</span>
+                      ${it.source ? `<span class="pill" style="font-size:10px">${escHtml(it.source)}</span>` : ''}
+                      <span class="pill mono" style="font-size:10px">S${it.stepIndex ?? 0}</span>
+                      <span class="mono" style="font-size:11px;color:var(--ink-muted)">~${escHtml(fmtTokens(it.tokens))}</span>
+                    </div>
+                    ${isItemOpen ? renderItemDetailHtml(cat.key, it, cachedDetail, isRaw, it.id, it.id, false) : ''}
+                  </div>
+                `;
+              }).join('') || `<div class="card-subtitle" style="padding:6px">0</div>`
+          }
+        </div>
+      `;
+    }
+
+    function bindAssistantKindButtons(scope) {
+      scope.querySelectorAll('[data-akind]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const k = btn.getAttribute('data-akind');
+          callbacks?.onChangeAssistantKind?.(assistantKind === k ? '' : k);
+        });
+      });
     }
 
     const headerHtml = `
@@ -109,15 +393,13 @@
       </div>
     `;
 
+    const pendingHydrations = [];
+    const catBuilt = new Set();
     let bodyHtml = '';
 
     if (viewMode === 'dna') {
       const dna = stepData.dna || { ribbon: [], list: [], totalTokens: 0 };
-      const filteredDna = dna.list.filter(it => {
-        if (!search) return true;
-        const hay = `${it.title} ${it.category} ${it.toolName || ''} ${it.body || ''}`.toLowerCase();
-        return hay.includes(search);
-      });
+      const dnaList = dna.list || [];
 
       bodyHtml = `
         <div style="display:flex;flex-direction:column;gap:6px">
@@ -125,30 +407,26 @@
           <div class="card-subtitle">${escHtml(t('dnaRibbonHint'))}</div>
         </div>
         <div class="browser-scroll" id="dna-list">
-          ${filteredDna.map(it => {
+          ${dnaList.map(it => {
             const cm = CAT_LABELS[it.category] || { i18n: 'catTools', color: 'var(--cat-tools)' };
-            const itemKey = `dna-${it.pos}`;
-            const isOpen = openItems.has(itemKey);
+            const toggleKey = `dna-${it.pos}`;
+            const itemId = it.itemId || toggleKey;
+            const isOpen = openItems.has(toggleKey);
+            const cachedDetail = isOpen ? (callbacks?.getCachedDetail?.(itemId) || null) : null;
+            if (isOpen && !cachedDetail) {
+              pendingHydrations.push({ toggleKey, itemId, catKey: it.category, isDna: true });
+            }
             return `
-              <div class="browser-item" data-dna-row="${it.pos}">
-                <div class="browser-item-head" data-toggle-item="${itemKey}">
+              <div class="browser-item" data-dna-row="${it.pos}" data-item-row="${escHtml(toggleKey)}">
+                <div class="browser-item-head" data-toggle-item="${escHtml(toggleKey)}" data-item-id="${escHtml(itemId)}" data-cat-key="${escHtml(it.category)}">
+                  <span data-item-chev style="color:var(--ink-muted);font-size:10px">${isOpen ? '▾' : '▸'}</span>
                   <span class="pill mono" style="font-size:10px">#${it.pos}</span>
                   <span class="legend-swatch" style="background:${cm.color}"></span>
                   <span class="browser-item-title">${escHtml(it.title)}</span>
                   <span class="pill mono" style="font-size:10px">S${it.stepIndex}</span>
                   <span class="mono" style="font-size:11px;color:var(--ink-muted)">~${escHtml(fmtTokens(it.tokens))}</span>
                 </div>
-                ${isOpen ? `
-                  <div class="browser-item-detail">
-                    <div class="filter-bar" style="justify-content:space-between">
-                      <span class="pill">${escHtml(t(cm.i18n))}</span>
-                      <button class="btn btn-sm" data-copy-text="${escHtml(encodeURIComponent(it.body || it.thinking || ''))}">${escHtml(t('copy'))}</button>
-                    </div>
-                    ${it.toolArgs ? `<pre class="code-block">${escHtml(JSON.stringify(it.toolArgs, null, 2))}</pre>` : ''}
-                    ${it.thinking ? `<pre class="code-block">${escHtml(it.thinking)}</pre>` : ''}
-                    ${it.body ? `<pre class="code-block">${escHtml(it.body)}</pre>` : ''}
-                  </div>
-                ` : ''}
+                ${isOpen ? renderItemDetailHtml(it.category, it, cachedDetail, rawItems.has(toggleKey), toggleKey, itemId, true) : ''}
               </div>
             `;
           }).join('') || `<div class="empty-state">${escHtml(t('noData'))}</div>`}
@@ -161,93 +439,25 @@
       for (const cat of categories) {
         const cm = CAT_LABELS[cat.key] || { i18n: 'catTools', color: 'var(--cat-tools)' };
         const isOpen = openCats.has(cat.key);
-
-        // Filter items by search & assistant kind
-        const searchMatched = (cat.items || []).filter(it => {
-          if (!search) return true;
-          const hay = `${it.title || ''} ${it.toolName || ''} ${it.skillName || ''} ${it.body || ''} ${it.answer || ''} ${it.thinking || ''}`.toLowerCase();
-          return hay.includes(search);
-        });
-
-        let kindCounts = null;
-        let visibleItems = searchMatched;
-        if (cat.key === 'assistant') {
-          kindCounts = {
-            thinking: searchMatched.filter(x => x.hasThinking).length,
-            tools: searchMatched.filter(x => x.hasTools).length,
-            answer: searchMatched.filter(x => x.hasAnswer).length,
-          };
-          if (assistantKind) {
-            visibleItems = searchMatched.filter(x =>
-              (assistantKind === 'thinking' && x.hasThinking) ||
-              (assistantKind === 'tools' && x.hasTools) ||
-              (assistantKind === 'answer' && x.hasAnswer)
-            );
-          }
-        }
-        visibleItems = sortItems(visibleItems, catSort[cat.key] || 'order');
+        const { visibleItems, kindCounts } = computeVisibleCatItems(cat);
+        if (isOpen) catBuilt.add(cat.key);
 
         bodyHtml += `
           <div class="cat-group" data-cat-group="${cat.key}">
             <div class="cat-header" data-toggle-cat="${cat.key}">
               <div style="display:flex;align-items:center;gap:7px;min-width:0">
-                <span style="color:var(--ink-muted);font-size:10px">${isOpen ? '▼' : '▶'}</span>
+                <span data-cat-chev style="color:var(--ink-muted);font-size:10px">${isOpen ? '▼' : '▶'}</span>
                 <span class="legend-swatch" style="background:${cm.color}"></span>
                 <span style="font-weight:600;font-size:12px">${escHtml(t(cm.i18n))}</span>
                 <span class="pill mono">${visibleItems.length}</span>
                 ${renderDeltaBadges(cat)}
               </div>
               <div class="filter-bar" style="gap:8px">
-                ${isOpen && visibleItems.length > 1 ? renderSortSelect(cat.key) : ''}
+                ${visibleItems.length > 1 ? renderSortSelect(cat.key, !isOpen) : ''}
                 <span class="mono" style="font-size:11.5px;color:var(--ink-secondary)">~${escHtml(fmtTokens(cat.tokens))}</span>
               </div>
             </div>
-            ${isOpen ? `
-              <div class="cat-body">
-                ${cat.key === 'assistant' && kindCounts ? `
-                  <div class="filter-bar" style="margin-bottom:2px">
-                    ${['thinking', 'tools', 'answer'].map(k => {
-                      const labelKey = k === 'thinking' ? 'filterThinking' : k === 'tools' ? 'filterTools' : 'filterAnswer';
-                      return `<button class="pill pill-btn ${assistantKind === k ? 'active' : ''}" data-akind="${k}">${escHtml(t(labelKey))} (${kindCounts[k]})</button>`;
-                    }).join('')}
-                  </div>
-                ` : ''}
-
-                ${cat.key === 'media'
-                  ? (visibleItems.length > 0
-                      ? `<div class="media-grid">${visibleItems.map(m => `
-                          <div class="media-card">
-                            ${m.attachmentUrl ? `<img class="media-thumb" src="${escHtml(m.attachmentUrl)}" alt="${escHtml(m.title)}" loading="lazy"/>` : `<div class="media-thumb" style="display:flex;align-items:center;justify-content:center;color:var(--ink-muted)">${escHtml(m.ext || 'FILE')}</div>`}
-                            <div class="media-meta">
-                              <div style="font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml(m.title)}">${escHtml(m.title)}</div>
-                              <div class="mono" style="color:var(--ink-muted)">${escHtml(fmtBytes(m.fileSize))} · ~${escHtml(fmtTokens(m.tokens))} tok</div>
-                            </div>
-                          </div>
-                        `).join('')}</div>`
-                      : `<div class="card-subtitle" style="padding:6px">0</div>`)
-                  : visibleItems.map(it => {
-                      const isItemOpen = openItems.has(it.id);
-                      const isRaw = rawItems.has(it.id);
-                      const statusPill = cat.key === 'tool_results'
-                        ? `<span class="pill ${it.isError ? 'pill-danger' : 'pill-good'}" style="font-size:10px">${it.isError ? 'ERR' : 'OK'}</span>`
-                        : '';
-                      return `
-                        <div class="browser-item" data-step-idx="${it.stepIndex ?? ''}">
-                          <div class="browser-item-head" data-toggle-item="${escHtml(it.id)}">
-                            <span style="color:var(--ink-muted);font-size:10px">${isItemOpen ? '▾' : '▸'}</span>
-                            ${statusPill}
-                            <span class="browser-item-title ${cat.key === 'tool_results' || cat.key === 'tool_defs' ? 'mono' : ''}">${escHtml(it.title || it.toolName || 'Item')}</span>
-                            ${it.source ? `<span class="pill" style="font-size:10px">${escHtml(it.source)}</span>` : ''}
-                            <span class="pill mono" style="font-size:10px">S${it.stepIndex ?? 0}</span>
-                            <span class="mono" style="font-size:11px;color:var(--ink-muted)">~${escHtml(fmtTokens(it.tokens))}</span>
-                          </div>
-                          ${isItemOpen ? renderItemDetail(cat.key, it, isRaw) : ''}
-                        </div>
-                      `;
-                    }).join('') || `<div class="card-subtitle" style="padding:6px">0</div>`
-                }
-              </div>
-            ` : ''}
+            ${isOpen ? renderCategoryBodyHtml(cat, visibleItems, kindCounts, pendingHydrations) : ''}
           </div>
         `;
       }
@@ -257,7 +467,6 @@
 
     container.innerHTML = `<div class="card">${headerHtml}${bodyHtml}</div>`;
 
-    // Bind interactive controls
     container.querySelectorAll('[data-bview]').forEach(btn => {
       btn.addEventListener('click', () => callbacks?.onChangeViewMode?.(btn.getAttribute('data-bview')));
     });
@@ -269,11 +478,54 @@
 
     const searchInput = container.querySelector('#br-search');
     if (searchInput) {
-      searchInput.addEventListener('input', () => callbacks?.onSearch?.(searchInput.value));
+      let searchTimer = null;
+      searchInput.addEventListener('input', () => {
+        clearTimeout(searchTimer);
+        searchTimer = setTimeout(() => callbacks?.onSearch?.(searchInput.value), 180);
+      });
     }
 
     container.querySelectorAll('[data-toggle-cat]').forEach(el => {
-      el.addEventListener('click', () => callbacks?.onToggleCat?.(el.getAttribute('data-toggle-cat')));
+      el.addEventListener('click', () => {
+        const catKey = el.getAttribute('data-toggle-cat');
+        const groupEl = el.closest('[data-cat-group]');
+        const chev = el.querySelector('[data-cat-chev]');
+        const sortSel = groupEl?.querySelector('[data-cat-sort]');
+        const willOpen = !openCats.has(catKey);
+        callbacks?.onToggleCat?.(catKey, { silent: true });
+
+        if (chev) chev.textContent = willOpen ? '▼' : '▶';
+        if (sortSel) sortSel.hidden = !willOpen;
+        if (!groupEl) return;
+
+        let bodyEl = groupEl.querySelector('.cat-body');
+        if (!willOpen) {
+          if (bodyEl) bodyEl.hidden = true;
+          return;
+        }
+
+        if (bodyEl && catBuilt.has(catKey)) {
+          bodyEl.hidden = false;
+          return;
+        }
+
+        const catObj = categoryByKey.get(catKey);
+        if (!catObj) return;
+        const { visibleItems, kindCounts } = computeVisibleCatItems(catObj);
+        const lazyHydrations = [];
+        groupEl.insertAdjacentHTML('beforeend', renderCategoryBodyHtml(catObj, visibleItems, kindCounts, lazyHydrations));
+        catBuilt.add(catKey);
+        bodyEl = groupEl.querySelector('.cat-body');
+        if (bodyEl) {
+          bindItemHeaders(bodyEl);
+          bindDetailControls(bodyEl);
+          bindAssistantKindButtons(bodyEl);
+          for (const h of lazyHydrations) {
+            const row = bodyEl.querySelector(`[data-item-row="${CSS.escape(h.toggleKey)}"]`);
+            if (row) void hydrateItemDetail(row, h.itemId, h.catKey, h.toggleKey, h.isDna);
+          }
+        }
+      });
     });
 
     container.querySelectorAll('[data-cat-sort]').forEach(sel => {
@@ -285,105 +537,31 @@
       });
     });
 
-    container.querySelectorAll('[data-toggle-item]').forEach(el => {
-      el.addEventListener('click', () => callbacks?.onToggleItem?.(el.getAttribute('data-toggle-item')));
-    });
+    bindItemHeaders(container);
+    bindDetailControls(container);
+    bindAssistantKindButtons(container);
 
-    container.querySelectorAll('[data-akind]').forEach(btn => {
-      btn.addEventListener('click', () => {
-        const k = btn.getAttribute('data-akind');
-        callbacks?.onChangeAssistantKind?.(assistantKind === k ? '' : k);
-      });
-    });
+    for (const h of pendingHydrations) {
+      const row = container.querySelector(`[data-item-row="${CSS.escape(h.toggleKey)}"]`);
+      if (row) void hydrateItemDetail(row, h.itemId, h.catKey, h.toggleKey, h.isDna);
+    }
 
-    container.querySelectorAll('[data-toggle-raw]').forEach(btn => {
-      btn.addEventListener('click', () => callbacks?.onToggleRaw?.(btn.getAttribute('data-toggle-raw')));
-    });
-
-    container.querySelectorAll('[data-copy-text]').forEach(btn => {
-      btn.addEventListener('click', async () => {
-        const decoded = decodeURIComponent(btn.getAttribute('data-copy-text') || '');
-        const ok = await AGY.bridge.copyText(decoded);
-        if (ok) {
-          const orig = btn.textContent;
-          btn.textContent = t('copied');
-          setTimeout(() => { btn.textContent = orig; }, 1200);
-        }
-      });
-    });
-
-    // Clicking a DNA ribbon segment jumps to and opens that item in the DNA list
+    // Clicking a DNA ribbon segment opens and scrolls to that item in-place
     container.querySelectorAll('[data-dna-pos]').forEach(seg => {
       seg.addEventListener('click', () => {
         const pos = seg.getAttribute('data-dna-pos');
-        callbacks?.onOpenDnaPos?.(pos);
+        const toggleKey = `dna-${pos}`;
+        const row = container.querySelector(`[data-dna-row="${pos}"]`);
+        if (row) {
+          if (!openItems.has(toggleKey)) {
+            row.querySelector('[data-toggle-item]')?.click();
+          }
+          row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        } else {
+          callbacks?.onOpenDnaPos?.(pos);
+        }
       });
     });
-
-    function renderItemDetail(catKey, it, isRaw) {
-      if (catKey === 'assistant') {
-        const parts = [];
-        if (it.thinking) {
-          parts.push(`<div><div class="card-subtitle" style="margin-bottom:4px">Thinking (~${escHtml(fmtTokens(it.thinkingTokens))})</div><pre class="code-block">${escHtml(it.thinking)}</pre></div>`);
-        }
-        if (it.toolCalls && it.toolCalls.length > 0) {
-          parts.push(`<div><div class="card-subtitle" style="margin-bottom:4px">Tool Calls (${it.toolCalls.length})</div><pre class="code-block">${escHtml(JSON.stringify(it.toolCalls, null, 2))}</pre></div>`);
-        }
-        if (it.answer) {
-          parts.push(`
-            <div>
-              <div class="filter-bar" style="justify-content:space-between;margin-bottom:4px">
-                <span class="card-subtitle">Answer (~${escHtml(fmtTokens(it.answerTokens))})</span>
-                <div class="filter-bar">
-                  <button class="btn btn-sm" data-toggle-raw="${escHtml(it.id)}">${escHtml(isRaw ? t('mdView') : t('rawView'))}</button>
-                  <button class="btn btn-sm" data-copy-text="${escHtml(encodeURIComponent(it.answer))}">${escHtml(t('copy'))}</button>
-                </div>
-              </div>
-              ${isRaw
-                ? `<pre class="code-block">${escHtml(it.answer)}</pre>`
-                : `<div class="md-rendered">${renderSimpleMarkdown(it.answer)}</div>`
-              }
-            </div>
-          `);
-        }
-        return `<div class="browser-item-detail">${parts.join('') || '<span class="card-subtitle">—</span>'}</div>`;
-      }
-
-      if (catKey === 'tool_results' || catKey === 'skills') {
-        const bodyText = it.body || it.rawBody || '';
-        return `
-          <div class="browser-item-detail">
-            <div class="filter-bar" style="justify-content:space-between">
-              <div class="filter-bar">
-                <span class="pill mono">${escHtml(it.toolName || 'tool')}</span>
-                ${it.lineCount ? `<span class="pill mono">${it.lineCount} ${escHtml(t('linesUnit'))}</span>` : ''}
-                ${it.durationMs ? `<span class="pill mono">${escHtml(fmtDuration(it.durationMs))}</span>` : ''}
-                ${it.exitCode !== null && it.exitCode !== undefined ? `<span class="pill mono">exit ${it.exitCode}</span>` : ''}
-              </div>
-              <div class="filter-bar">
-                <button class="btn btn-sm" data-toggle-raw="${escHtml(it.id)}">${escHtml(isRaw ? t('mdView') : t('rawView'))}</button>
-                <button class="btn btn-sm" data-copy-text="${escHtml(encodeURIComponent(bodyText))}">${escHtml(t('copy'))}</button>
-              </div>
-            </div>
-            ${it.toolArgs && Object.keys(it.toolArgs).length > 0 ? `<pre class="code-block" style="max-height:140px">${escHtml(JSON.stringify(it.toolArgs, null, 2))}</pre>` : ''}
-            ${isRaw
-              ? `<pre class="code-block">${escHtml(bodyText)}</pre>`
-              : `<div class="md-rendered">${renderSimpleMarkdown(bodyText)}</div>`
-            }
-          </div>
-        `;
-      }
-
-      const content = it.body || it.rawBody || '';
-      return `
-        <div class="browser-item-detail">
-          <div class="filter-bar" style="justify-content:flex-end">
-            <button class="btn btn-sm" data-copy-text="${escHtml(encodeURIComponent(content))}">${escHtml(t('copy'))}</button>
-          </div>
-          <pre class="code-block">${escHtml(content)}</pre>
-        </div>
-      `;
-    }
   }
 
   AGY.views = AGY.views || {};

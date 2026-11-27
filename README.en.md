@@ -17,7 +17,8 @@ A context insights plugin for **Google Antigravity**. It puts per-request contex
 
 Full-width `Context Insights` page (sidebar) and the same tab in the aux pane.
 
-- **KPIs**: billable tokens, estimated cost, weighted cache hit rate, active sessions & turns, tool executions, active time
+- **Weekly Quota window (`Weekly Quota`)**: queries Antigravity `RetrieveUserQuotaSummary` for real `[resetTime - 7d, resetTime)` cycles using 5-minute + model-pool (`Gemini` / `Claude & GPT`) slices, displaying remaining quota %, reset countdowns, and pool filter chips (falls back to local calendar week when the LS is unavailable)
+- **KPIs**: billable tokens, estimated cost, weighted cache hit rate (including `cacheCreationTokens` and excluding `CHECKPOINT` compaction overhead), active sessions & turns, tool executions, active time
 - **7-day usage & cost** chart, **8-week heatmap** (click a day to filter sessions)
 - **Rankings**: skills loaded, tool calls, command programs — click to filter
 - **Billing composition** donut plus sortable session cards (recent / tokens / context size / cost)
@@ -26,12 +27,13 @@ Full-width `Context Insights` page (sidebar) and the same tab in the aux pane.
 
 The right-hand aux pane, scoped to the current conversation.
 
-- **Session isolation**: reads the host-injected `conversationId`; the 6s poll only switches when the host session actually changes
-- **Stats**: Context (turns / steps / tools / commands / billing), Token (billable total, category split, cache hit; tool definitions listed separately), Timing (model wait / tool execution / overhead)
-- **Current context**: official language-service snapshot with dual baselines (effective 512k vs native 1M), composition bar, and per-category breakdown
+- **Session isolation & instant switching**: reads the host-injected `conversationId`, polls every 3s with `rev` short-circuiting (skipping payloads & DOM rebuilds when unchanged), and switches top-level tabs instantaneously from memory cache with background revalidation
+- **Stats**: Context (turns / steps / tools / commands / billing), Token (billable total, category split, official cache hit; tool definitions listed separately), Timing (official streaming decode tok/s for latest request + weighted average + TTFT tooltip, model wait / tool execution / overhead)
+- **Current context**: official language-service snapshot with dual baselines (effective 512k vs native 1M), composition bar, immediate post-`/compact` reset, and per-category breakdown
 - **Timeline**: Step/Turn × Total/Delta/Overview, event markers (compaction, skill, model switch, error, slowest, largest growth), hover sync, step brief
-- **Context Browser & DNA**: collapsible categories, in-category sorting, `vs Prev Turn/Step` deltas, `Thinking / Tools / Answer`, `Raw / Markdown`, image thumbnails, and a read-order **DNA strip**
-- **Events, File Activity, Command Executions**, all linked to the selected step
+- **Recent Calls (collapsible paginated table)**: 11-column per-request official telemetry ledger (`Time`, `Actual Model` with two-pass `Plan` / `Exec` role badges, `Input`, `Net Δ`, `Output` with explicit/implicit `Think %`, `Cache Hit` with `Warm` / `Partial` / `Cold` / `Switch Cold`, `Cost`, `TTFT`, `Total`, `Speed` with `Short` sample guard, `Status`); supports `10 / 20 / 50` page sizes, filters, and row click to jump to timeline & browser
+- **Context Browser & DNA**: slim list payload with ~94% smaller `/api/step`, on-demand single-item detail loading (`?itemId=`) + backend full-text search (`?q=`), zero-lag in-place category/item/Raw-Markdown toggles, sorting, `vs Prev Turn/Step` deltas, image thumbnails, and a read-order **DNA strip**
+- **Events, File Activity, Command Executions**: all collapsible in-place (plus per-file expansion) and linked to the selected step
 
 ### 3. Fleet
 
@@ -77,6 +79,18 @@ Then open **Customizations → agy-context**, enable the plugin and the **Antigr
 - `Context Insights` → cross-session cost, rankings, and session cards
 - `Fleet` → parent/child agents, collaboration swimlanes, delegation reports
 
+## Changelog
+
+### v0.1.2
+- **Recent Calls collapsible paginated table**: 11-column per-call telemetry table with Plan/Exec role attribution, thinking share, Cold/Partial/Warm cache badges, short-sample speed guard, retry/error states, pagination (`10 / 20 / 50`), filters, and step jump links.
+- **0ms in-place folding & performance overhaul**: added card-level in-place collapse toggles to Recent Calls, Events, Files, and Commands; slimmed `/api/step` by ~94% with on-demand item loading (`?itemId=`) and backend full-text search (`?q=`); added `rev` poll short-circuiting, stale-while-revalidate tab switching, and `content-visibility: auto`.
+
+### v0.1.1
+- **Weekly Quota Insights view**: added `Weekly Quota` range backed by `RetrieveUserQuotaSummary`, 5-minute + model-pool slicing, and calendar-week fallback; aligned streaming decode tok/s and cache hit rate with official telemetry plus immediate post-`/compact` context reset.
+
+### v0.1.0
+- Initial release: cross-session insights, Context dashboard, Context Browser & DNA view, Events/Files/Commands tracking, and multi-agent Fleet view.
+
 ## Compared with dsh-context
 
 Reference: [dsh-context](https://github.com/bowenliang123/dsh-context) 0.87. See [docs/parity-with-dsh-context.md](docs/parity-with-dsh-context.md).
@@ -110,7 +124,7 @@ Reference: [dsh-context](https://github.com/bowenliang123/dsh-context) 0.87. See
 - **L1 metadata**: read-only `conversation_summaries.db` (`node:sqlite`, directory-scan fallback)
 - **L2 incremental projection cache**: updated by `transcript.jsonl` `mtimeMs + size`
 - **L3 on-demand details**: stream `transcript_full.jsonl` per step, LRU cache of 4 sessions
-- **Official snapshot**: `GetCascadeTrajectoryGeneratorMetadata` via `ANTIGRAVITY_LS_ADDRESS` / `ANTIGRAVITY_CSRF_TOKEN`
+- **Official snapshot & quota**: `GetCascadeTrajectoryGeneratorMetadata` and `RetrieveUserQuotaSummary` via `ANTIGRAVITY_LS_ADDRESS` / `ANTIGRAVITY_CSRF_TOKEN`, with on-demand `/api/step?itemId=`, backend search (`?q=`), and `rev` short-circuit polling
 - **Checkpoints**: `CHECKPOINT` steps reset the cumulative context and are recorded as compaction events
 
 ## Development

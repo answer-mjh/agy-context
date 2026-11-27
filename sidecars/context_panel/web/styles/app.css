@@ -1,4 +1,5 @@
 *, *::before, *::after { box-sizing: border-box; }
+[hidden] { display: none !important; }
 
 html, body {
   margin: 0;
@@ -496,6 +497,8 @@ body[data-view="aux"] .session-select { max-width: 170px; }
   background: var(--surface-well);
   overflow: hidden;
   flex-shrink: 0;
+  content-visibility: auto;
+  contain-intrinsic-size: 38px;
 }
 
 .browser-item-head {
@@ -707,6 +710,8 @@ body[data-view="aux"] .split-panel { grid-template-columns: 1fr; }
   display: flex;
   flex-direction: column;
   gap: 6px;
+  content-visibility: auto;
+  contain-intrinsic-size: 38px;
 }
 
 .row-head {
@@ -2027,6 +2032,197 @@ body[data-view="aux"] .split-panel { grid-template-columns: 1fr; }
 
 .fleet-more-btn {
   margin-top: 8px;
+}
+
+/* ═══ Recent Calls Collapsible Paginated Table ═══ */
+.calls-fold-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: none;
+  background: transparent;
+  padding: 0;
+  color: var(--ink);
+  font: inherit;
+  cursor: pointer;
+}
+
+.calls-chevron {
+  font-size: 12px;
+  color: var(--ink-muted);
+}
+
+.calls-table-wrap {
+  width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-subtle, var(--surface));
+}
+
+.calls-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.calls-table thead th {
+  text-align: left;
+  padding: 8px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--ink-muted);
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.calls-table tbody td {
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--border);
+  color: var(--ink);
+  vertical-align: middle;
+}
+
+.calls-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.calls-row {
+  cursor: pointer;
+  transition: background 0.12s;
+}
+
+.calls-row:hover {
+  background: var(--surface-hover);
+}
+
+.calls-row.is-pinned {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.calls-table th.calls-num,
+.calls-table td.calls-num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.calls-muted {
+  color: var(--ink-muted);
+}
+
+.calls-sub {
+  font-size: 11px;
+  color: var(--ink-muted);
+}
+
+.calls-delta-drop {
+  color: var(--good);
+  font-weight: 600;
+}
+
+.calls-model-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.calls-role-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+  border: 1px solid transparent;
+}
+
+.calls-role-badge.is-orch {
+  color: #6366f1;
+  background: color-mix(in srgb, #6366f1 12%, transparent);
+  border-color: color-mix(in srgb, #6366f1 35%, transparent);
+}
+
+.calls-role-badge.is-exec {
+  color: var(--good);
+  background: color-mix(in srgb, var(--good) 12%, transparent);
+  border-color: color-mix(in srgb, var(--good) 35%, transparent);
+}
+
+.calls-cache-hi {
+  color: #0ea5e9;
+  font-weight: 600;
+}
+
+.calls-cache-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+  border: 1px solid transparent;
+}
+
+.calls-cache-pill.is-warm {
+  color: var(--good);
+  background: color-mix(in srgb, var(--good) 12%, transparent);
+  border-color: color-mix(in srgb, var(--good) 35%, transparent);
+}
+
+.calls-cache-pill.is-partial {
+  color: #d97706;
+  background: color-mix(in srgb, #f59e0b 14%, transparent);
+  border-color: color-mix(in srgb, #f59e0b 38%, transparent);
+}
+
+.calls-cache-pill.is-cold {
+  color: var(--ink-secondary);
+  background: var(--surface);
+  border-color: var(--border);
+}
+
+.calls-short-sample {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: var(--radius-sm, 4px);
+  font-size: 10px;
+  color: var(--ink-secondary);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  cursor: help;
+}
+
+.calls-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.calls-status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--good);
+}
+
+.calls-status.is-ok { color: var(--good); }
+.calls-status.is-ok .calls-status-dot { background: var(--good); }
+.calls-status.is-retry { color: #d97706; }
+.calls-status.is-retry .calls-status-dot { background: #f59e0b; }
+.calls-status.is-err { color: var(--danger); }
+.calls-status.is-err .calls-status-dot { background: var(--danger); }
+
+.calls-pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding-top: 8px;
 }
 
 /* ═══ DSH Responsive Breakpoints ═══ */

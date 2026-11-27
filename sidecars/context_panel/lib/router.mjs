@@ -35,6 +35,7 @@ export const STATIC_WEB_PATHS = [
   '/js/views/fleet.js',
   '/js/views/stats.js',
   '/js/views/timeline.js',
+  '/js/views/calls.js',
   '/js/views/browser.js',
   '/js/views/events.js',
   '/js/views/files.js',
@@ -58,7 +59,7 @@ function normalizeQuery(raw) {
   return out;
 }
 
-export function createRouter({ version = '0.1.1' } = {}) {
+export function createRouter({ version = '0.1.2' } = {}) {
   const projectionStore = new ProjectionStore();
   const detailStore = new SessionDetailStore();
   const fleetStore = new FleetStore(projectionStore, detailStore);
@@ -77,6 +78,7 @@ export function createRouter({ version = '0.1.1' } = {}) {
       '/js/views/fleet.js',
       '/js/views/stats.js',
       '/js/views/timeline.js',
+      '/js/views/calls.js',
       '/js/views/browser.js',
       '/js/views/events.js',
       '/js/views/files.js',
@@ -134,9 +136,9 @@ export function createRouter({ version = '0.1.1' } = {}) {
 
   async function handleInsights(rawQuery) {
     const q = normalizeQuery(rawQuery);
+    const force = q.force === '1' || q.force === 'true';
     const data = await projectionStore.getInsights(q);
-    const etag = computeEtag({
-      generatedAtBucket: Math.floor(data.generatedAt / 5000),
+    const rev = computeEtag({
       kpi: data.kpi,
       sessions: data.sessions.map(s => [s.id, s.lastMs, s.billableTokens]),
       range: data.range,
@@ -144,10 +146,17 @@ export function createRouter({ version = '0.1.1' } = {}) {
       weeklyQuotaReset: data.weeklyQuota?.resetAt || data.weeklyQuota?.cycleEndMs || 0,
       selectedDay: data.selectedDay,
     });
+    if (!force && q.rev && q.rev === rev) {
+      return {
+        status: 200,
+        body: { unchanged: true, rev },
+        headers: { ETag: rev, 'Cache-Control': 'no-cache' },
+      };
+    }
     return {
       status: 200,
-      body: data,
-      headers: { ETag: etag, 'Cache-Control': 'no-cache' },
+      body: { ...data, rev },
+      headers: { ETag: rev, 'Cache-Control': 'no-cache' },
     };
   }
 
@@ -208,10 +217,20 @@ export function createRouter({ version = '0.1.1' } = {}) {
       };
     }
 
+    const rev = `${overview.rev}|${fleetSummary?.agents || 0}:${fleetSummary?.running || 0}|${sessions.length}:${sessions[0]?.id || ''}:${sessions[0]?.lastMs || 0}`;
+    if (!force && q.rev && q.rev === rev) {
+      return {
+        status: 200,
+        body: { unchanged: true, rev },
+        headers: { 'Cache-Control': 'no-cache' },
+      };
+    }
+
     return {
       status: 200,
       body: {
         empty: false,
+        rev,
         sessions: sessionOptions,
         fleet: fleetSummary,
         session: overview,
@@ -289,11 +308,28 @@ export function createRouter({ version = '0.1.1' } = {}) {
     const meta = sessions.find(s => s.id === convId) || null;
     const seq = q.step !== undefined && q.step !== '' ? Number(q.step) : -1;
     const baseline = q.baseline === 'prev_step' ? 'prev_step' : 'prev_turn';
-    const data = await detailStore.getStepBrowser(convId, meta, Number.isFinite(seq) ? seq : -1, baseline, { force });
+    const itemId = (q.itemId || '').trim();
+    const searchQ = (q.q || '').trim();
+    const ifRev = (q.rev || '').trim();
+    const data = await detailStore.getStepBrowser(convId, meta, Number.isFinite(seq) ? seq : -1, baseline, {
+      force,
+      itemId,
+      q: searchQ,
+    });
     if (!data) {
       return {
         status: 200,
         body: { empty: true, reason: 'no_transcript_yet', id: convId, categories: [], dna: { ribbon: [], list: [], totalTokens: 0 } },
+        headers: { 'Cache-Control': 'no-cache' },
+      };
+    }
+    if (itemId) {
+      return { status: 200, body: data, headers: { 'Cache-Control': 'no-cache' } };
+    }
+    if (!force && !searchQ && ifRev && data.rev && ifRev === data.rev) {
+      return {
+        status: 200,
+        body: { unchanged: true, rev: data.rev },
         headers: { 'Cache-Control': 'no-cache' },
       };
     }

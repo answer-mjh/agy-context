@@ -17,6 +17,7 @@
 - [截图](#截图)
 - [安装](#安装)
 - [使用](#使用)
+- [更新日志](#更新日志)
 - [与 dsh-context 对比](#与-dsh-context-对比)
 - [已知限制](#已知限制)
 - [工作原理](#工作原理)
@@ -29,7 +30,8 @@
 
 ### 1. 上下文洞察（左侧 `Context Insights` 全宽页 / 右侧面板同名标签）
 
-- **KPI 栏**：总计费 Token、预估成本、加权缓存命中率、活跃会话与轮次数、工具执行数、活跃时长。
+- **周限额周期视图（`周限额`）**：对接 Antigravity 语言服务 `RetrieveUserQuotaSummary`，按真实 `[resetTime - 7d, resetTime)` 重置周期、以 **5 分钟 + 模型额度池（Gemini / Claude & GPT）** 切片精确统计，顶部展示各额度池剩余百分比与重置倒计时，并支持按池筛选；语言服务不可用时自动回退自然周。
+- **KPI 栏**：总计费 Token、预估成本、加权缓存命中率（含 `cacheCreationTokens` 并排除 `CHECKPOINT`）、活跃会话与轮次数、工具执行数、活跃时长。
 - **7 天用量与成本**：按每次请求的实际时间归因，成对柱状图展示每日 Token 与费用。
 - **8 周热力图**：近 56 天每日用量密度，点击任意日期筛选当天会话。
 - **排行**：技能加载（`SKILL.md`）、工具调用、命令执行程序分布，点击条目反向筛选会话。
@@ -38,12 +40,13 @@
 
 ### 2. Context 面板（右侧辅助面板，默认页）
 
-- **会话级隔离**：读取宿主注入的 `conversationId`，不同会话各自显示 Token、上下文、时间线与事件；6 秒轮询只在宿主会话真正变化时切换，不覆盖手动选择。
-- **Stats 三卡**：Context Stats（轮次 / 步数 / 技能 / 输入输出 / 工具 / 命令 / 计费，带参考单价提示与跳转胶囊）、Token Stats（计费总量 + 分类占比 + 缓存命中率，工具定义与工具调用分列）、Timing Stats（模型等待 / 工具执行 / 其他开销）。
-- **当前上下文**：优先读取 Antigravity 语言服务官方快照，同时显示有效窗口（如 512k）与原生窗口（如 1M）双基准、真实占用比例，以及系统提示词、工具定义、用户消息、注入内容、技能注入、模型回复、工具调用、媒体、输出预留的组成条。
+- **会话级隔离与极速刷新**：读取宿主注入的 `conversationId`，3 秒增量轮询（`rev` 无变化短路，仅返回几十字节、零重绘）；切换顶部「洞察 / Context / 编队」标签页优先用内存缓存秒开渲染并在后台静默校对。
+- **Stats 三卡**：Context Stats（轮次 / 步数 / 技能 / 输入输出 / 工具 / 命令 / 计费，带参考单价提示与跳转胶囊）、Token Stats（计费总量 + 分类占比 + 官方口径缓存命中率，工具定义与工具调用分列）、Timing Stats（纯流式生成速度含最近一次 + 会话加权平均 + 首字延迟 TTFT 悬浮明细、模型等待 / 工具执行 / 其他开销）。
+- **当前上下文**：优先读取 Antigravity 语言服务官方快照，同时显示有效窗口（如 512k）与原生窗口（如 1M）双基准、真实占用比例、`/compact` 检查点后立即清零重置的上下文组成条（系统提示词、工具定义、用户消息、注入内容、技能注入、模型回复、工具调用、媒体、输出预留）。
 - **上下文时间线**：`Step / Turn` 粒度 × `Total / Delta / 总览` 模式，事件旗标（压缩、技能、切模型、错误、最慢、最大增长），悬停联动浏览器，附 `User / In / Response` 三行步骤摘要。
-- **上下文浏览器**：可折叠分类、分类内按原始顺序 / 大小 / 名称 / 步骤排序（工具定义另有按调用次数）、`vs Prev Turn / vs Prev Step` 差异徽标、`Thinking / Tools / Answer` 筛选、`Raw / Markdown` 切换、工具返回图片与附件缩略卡，以及按模型读取顺序绘制的 **DNA 色带**。
-- **事件、文件、命令**：注入 / 压缩 / 技能 / 切模型 / 错误事件流；按 Read / Written / Searched / Images 筛选的文件活动与增删行估算；程序分布、最慢 / 失败命令与命令执行流，均可跳转到对应步骤。
+- **最近调用明细（可折叠分页表格）**：11 列官方级单次模型调用遥测——`时间`、`实际模型`（支持基于交接点的两遍归因 `编排` / `执行` 徽标）、`输入`、`净增量 Δ`、`输出`（含显式/隐式思考占比）、`缓存命中率`（`热缓存` / `部分命中` / `冷启动` / `切换冷启动`）、`费用`、`首字耗时`、`总耗时`、`速度`（`短样本` 噪声守卫）、`状态`（成功 / 重试 / 失败）；支持 `10 / 20 / 50` 条分页、状态筛选与点击行跳转定位时间线及浏览器。
+- **上下文浏览器**：按列表瘦身 + 按需加载单条正文（`/api/step?itemId=...`）与后端全文检索（`?q=...`）运行，大长会话点击分类/条目 0ms 跟手展开；支持分类内排序、`vs Prev Turn / vs Prev Step` 差异徽标、`Thinking / Tools / Answer` 筛选、`Raw / Markdown` 原地切换、图片附件缩略卡与 **DNA 色带**。
+- **事件、文件、命令**：三张卡片均支持顶部一键 0ms 原地折叠/展开；注入 / 压缩 / 技能 / 切模型 / 错误事件流；按 Read / Written / Searched / Images 筛选的文件活动（单文件明细同样原地展开）与增删行估算；程序分布、最慢 / 失败命令与命令执行流，均可跳转到对应步骤。
 
 ### 3. 编队（Fleet）
 
@@ -105,6 +108,18 @@ cp -R agy-context ~/.gemini/config/plugins/agy-context
 - **看多 Agent 协作**：`编队` 标签页查看父子谱系、泳道时间线与任务回报。
 - 面板右上角：刷新、`EN / 中文` 切换、偏好设置（范围、趋势粒度与模式、浏览器基线、编队标签显隐）。
 
+## 更新日志
+
+### v0.1.2
+- **新增 Context 面板「最近调用明细」可折叠分页表格**：完整呈现 11 列单次模型调用遥测（含 `编排`/`执行` 角色标签、显式/隐式思考占比、`热缓存/部分命中/冷启动/切换冷启动`、`短样本` 速度守卫、重试与错误状态），支持分页、筛选及点击跳转时间线。
+- **全卡片 0ms 原地折叠与性能重构**：为「调用明细」「上下文事件」「文件活动」「命令执行」补充卡片折叠；`/api/step` 列表瘦身约 94% 并改为按需加载单条正文（保留后端全文搜索 `?q=`）；新增 3 秒轮询 `rev` 增量短路、顶部标签页缓存秒切与 `content-visibility: auto`。
+
+### v0.1.1
+- **新增「周限额」洞察视角**：对接语言服务 `RetrieveUserQuotaSummary` 展示 `Gemini` / `Claude & GPT` 剩余额度与重置倒计时，按 `[resetTime - 7d, resetTime)` 及 5 分钟 + 模型池切片精确聚合；对齐官方纯流式生成速度（最近一次 + 加权平均）与含 `cacheCreationTokens` 的缓存命中率口径，支持 `/compact` 后上下文立即清零。
+
+### v0.1.0
+- 初始版本：跨会话上下文洞察、单会话 Context 面板、Context 浏览器与 DNA 视图、事件/文件/命令追踪及多 Agent 编队视图。
+
 ## 与 dsh-context 对比
 
 参考实现：[dsh-context](https://github.com/bowenliang123/dsh-context) 0.87（DeepSeek Harness 插件）。逐项说明见 [docs/parity-with-dsh-context.md](docs/parity-with-dsh-context.md)。
@@ -138,7 +153,8 @@ cp -R agy-context ~/.gemini/config/plugins/agy-context
 - **L1 元数据**：只读 `~/.gemini/antigravity/conversation_summaries.db`（`node:sqlite`，不可用时降级为目录扫描）。
 - **L2 增量投影缓存**：按 `transcript.jsonl` 的 `mtimeMs + size` 增量更新精简摘要，缓存到 `${ANTIGRAVITY_EXECUTABLE_DATA_DIR}`。
 - **L3 按需明细**：打开单步浏览器时流式解析 `transcript_full.jsonl`，LRU 缓存最近 4 个会话。
-- **官方上下文快照**：通过 sidecar 注入的 `ANTIGRAVITY_LS_ADDRESS` / `ANTIGRAVITY_CSRF_TOKEN` 调用 `GetCascadeTrajectoryGeneratorMetadata`，读取 `estimatedTokensUsed`、`maxContextTokens`、`tokenBreakdown.groups`、`promptSections` 与工具定义；失败则回退 transcript 估算。
+- **官方上下文快照与周限额**：通过 sidecar 注入的 `ANTIGRAVITY_LS_ADDRESS` / `ANTIGRAVITY_CSRF_TOKEN` 调用 `GetCascadeTrajectoryGeneratorMetadata` 与 `RetrieveUserQuotaSummary`，读取双窗口上下文占比、思考/流式耗时、缓存创建/读取指标、模型配额池剩余百分比与重置时间；不可用时平滑回退本地估算与自然周。
+- **按需正文与 `rev` 增量短路**：`/api/step` 列表仅传输轻量元数据，单条展开通过 `?itemId=` 毫秒级按需加载并缓存，全文搜索走 `?q=` 后端检索；轮询携带 `rev` 在数据未变更时直接返回 `{ unchanged: true }`，避免无意义传输与整页重建。
 - **系统提示词与工具定义**：`system_base` 逐条展示官方 `promptSections`；`tool_defs` 展示工具的完整描述与 JSON Schema，并按 `MCP` / `Antigravity` / `native` / `raw` 标注来源。
 - **压缩检查点**：识别 `CHECKPOINT` 步骤，重置累计上下文、把摘要计入新上下文，并单独记录压缩事件与计费。
 
