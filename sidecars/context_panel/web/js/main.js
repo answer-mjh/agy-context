@@ -62,6 +62,7 @@
       catSort: {},
     },
     events: { type: 'all', collapsed: false },
+    models: { collapsed: false },
     calls: { collapsed: false, filter: 'all', page: 1, pageSize: 20 },
     files: { kind: 'all', search: '', sortBy: 'ops', expanded: new Set(), collapsed: false },
     commands: { status: 'all', search: '', program: '', collapsed: false },
@@ -583,6 +584,7 @@
 
     main.innerHTML = `
       <div id="ctx-stats-host" style="display:flex;flex-direction:column;gap:12px"></div>
+      <div id="ctx-models-host"></div>
       <div class="grid-timeline-browser">
         <div style="display:flex;flex-direction:column;gap:12px;min-width:0">
           <div id="ctx-current-host"></div>
@@ -597,6 +599,7 @@
     `;
 
     renderStatsSection(document.getElementById('ctx-stats-host'));
+    renderModelsSection(document.getElementById('ctx-models-host'));
     AGY.views.stats.renderCurrentContext(document.getElementById('ctx-current-host'), appState.sessionData);
     renderTimelineSection(document.getElementById('ctx-timeline-host'));
     renderBrowserSection(document.getElementById('ctx-browser-host'));
@@ -604,6 +607,16 @@
     renderEventsSection(document.getElementById('ctx-events-host'));
     renderFilesSection(document.getElementById('ctx-files-host'));
     renderCommandsSection(document.getElementById('ctx-commands-host'));
+  }
+
+  function renderModelsSection(host) {
+    if (!host || !AGY.views.models) return;
+    AGY.views.models.render(host, appState.sessionData?.modelUsage || null, appState.models, {
+      onToggleCollapse: (nextCollapsed, opts) => {
+        appState.models.collapsed = typeof nextCollapsed === 'boolean' ? nextCollapsed : !appState.models.collapsed;
+        if (!opts?.silent) renderModelsSection(host);
+      },
+    });
   }
 
   function renderStatsSection(host) {

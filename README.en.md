@@ -29,6 +29,7 @@ The right-hand aux pane, scoped to the current conversation.
 
 - **Session isolation & instant switching**: reads the host-injected `conversationId`, polls every 3s with `rev` short-circuiting (skipping payloads & DOM rebuilds when unchanged), and switches top-level tabs instantaneously from memory cache with background revalidation
 - **Stats**: Context (turns / steps / tools / commands / billing), Token (billable total, category split, official cache hit; tool definitions listed separately), Timing (official streaming decode tok/s for latest request + weighted average + TTFT tooltip, model wait / tool execution / overhead)
+- **Model & Orchestrator Usage**: localized model/effort labels, top route pill (`Planner → Executor`), and collapsible **Orchestrator vs Executor** (or per-model **Model Usage**) card with cold-switch & compaction cost tracking
 - **Current context**: official language-service snapshot with dual baselines (effective 512k vs native 1M), composition bar, immediate post-`/compact` reset, and per-category breakdown
 - **Timeline**: Step/Turn × Total/Delta/Overview, event markers (compaction, skill, model switch, error, slowest, largest growth), hover sync, step brief
 - **Recent Calls (collapsible paginated table)**: 11-column per-request official telemetry ledger (`Time`, `Actual Model` with two-pass `Plan` / `Exec` role badges, `Input`, `Net Δ`, `Output` with explicit/implicit `Think %`, `Cache Hit` with `Warm` / `Partial` / `Cold` / `Switch Cold`, `Cost`, `TTFT`, `Total`, `Speed` with `Short` sample guard, `Status`); supports `10 / 20 / 50` page sizes, filters, and row click to jump to timeline & browser
@@ -80,6 +81,10 @@ Then open **Customizations → agy-context**, enable the plugin and the **Antigr
 - `Fleet` → parent/child agents, collaboration swimlanes, delegation reports
 
 ## Changelog
+
+### v0.1.3
+- **Orchestrator vs Executor / Model Usage card & route pill**: localized model/effort labels, cold-switch tracking, 0ms folding, and left-aligned Tool Calls layout.
+- **Unified pricing & compaction reconciliation**: aligned official dated rates and included `CHECKPOINT` compaction costs so cards match top billing totals.
 
 ### v0.1.2
 - **Recent Calls collapsible paginated table**: 11-column per-call telemetry table with Plan/Exec role attribution, thinking share, Cold/Partial/Warm cache badges, short-sample speed guard, retry/error states, pagination (`10 / 20 / 50`), filters, and step jump links.

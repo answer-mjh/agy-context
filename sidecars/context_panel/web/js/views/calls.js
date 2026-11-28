@@ -16,7 +16,8 @@
   }
 
   function renderCalls(container, steps, state, callbacks) {
-    const { t, fmtSignedTokens, fmtClock, escHtml } = AGY.i18n;
+    const { t, fmtSignedTokens, fmtClock, escHtml, getLang } = AGY.i18n;
+    const isZh = getLang() === 'zh';
     const allOrdered = [...(Array.isArray(steps) ? steps : [])].reverse();
     let isCollapsed = Boolean(state?.collapsed);
     const filter = state?.filter || 'all';
@@ -102,8 +103,9 @@
                     ${pageRows.map((s) => {
                       const a = s.actual || {};
                       const timeStr = fmtClock(s.createdAt) || '—';
-                      const modelName = s.actualModel || s.modelLabel || s.model || '—';
-                      const modelTip = [s.modelLabel, s.actualModel, s.model].filter((v, i, arr) => v && arr.indexOf(v) === i).join(' · ');
+                      const localizedLabel = isZh ? (s.modelLabelZh || s.modelLabel) : (s.modelLabel || s.modelLabelZh);
+                      const modelName = localizedLabel || s.actualModel || s.model || '—';
+                      const modelTip = [localizedLabel, s.actualModel, s.model].filter((v, i, arr) => v && arr.indexOf(v) === i).join(' · ');
                       const roleBadge = s.callRole === 'orchestrator'
                         ? `<span class="calls-role-badge is-orch">${escHtml(t('callsRoleOrch'))}</span>`
                         : s.callRole === 'executor'

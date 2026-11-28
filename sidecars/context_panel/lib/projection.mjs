@@ -16,9 +16,14 @@ import {
   parseOfficialContext,
 } from './official-context.mjs';
 
-const CACHE_VERSION = 11;
+const CACHE_VERSION = 12;
 const SLICE_MS = 5 * 60 * 1000;
 const HOUR_MS = 60 * 60 * 1000;
+
+function resolveQuotaPool(modelId) {
+  const pool = getModelSpec(modelId).quotaPool;
+  return pool && pool !== 'other' ? pool : inferModelQuotaPool(modelId);
+}
 
 function getCachePath() {
   const live = Boolean(process.env.ANTIGRAVITY_LS_ADDRESS && process.env.ANTIGRAVITY_CSRF_TOKEN);
@@ -195,7 +200,7 @@ async function buildConversationProjection(convId, transcriptPath, meta) {
         const nextS = parsed.steps[look];
         if (nextS.type === 'USER_INPUT') break;
         if (nextS.type === 'PLANNER_RESPONSE' && nextS.model) {
-          turnPool = inferModelQuotaPool(nextS.model);
+          turnPool = resolveQuotaPool(nextS.model);
           break;
         }
       }
@@ -246,7 +251,7 @@ async function buildConversationProjection(convId, transcriptPath, meta) {
         dayEntry.requests++;
       }
 
-      const cpPool = inferModelQuotaPool(s.model || latestModel);
+      const cpPool = resolveQuotaPool(s.model || latestModel);
       if (cpPool !== 'other') lastPool = cpPool;
       const cpSlice = ensureSlice(s.createdMs, cpPool);
       if (cpSlice) {
@@ -363,7 +368,7 @@ async function buildConversationProjection(convId, transcriptPath, meta) {
         dayEntry.requests++;
       }
 
-      const prPool = inferModelQuotaPool(s.model || latestModel);
+      const prPool = resolveQuotaPool(s.model || latestModel);
       if (prPool !== 'other') lastPool = prPool;
       const prSlice = ensureSlice(s.createdMs, prPool);
       if (prSlice) {
@@ -486,7 +491,7 @@ async function buildConversationProjection(convId, transcriptPath, meta) {
 
   const metaUpdatedMs = meta?.lastModifiedTime ? toMillis(meta.lastModifiedTime) : 0;
   const updatedMs = Math.max(lastMs, metaUpdatedMs, parsed.mtimeMs);
-  const spec = getModelSpec(latestModel);
+  const spec = getModelSpec(latestModel, { at: updatedMs || Date.now() });
   const effectiveWindow = official?.maxContextTokens || latestWindow || spec.contextWindow;
   const nativeWindow = Math.max(official?.nativeContextWindow || 0, spec.contextWindow, effectiveWindow);
 

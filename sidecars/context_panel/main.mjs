@@ -40,7 +40,7 @@ function readPluginVersion() {
       // ignore
     }
   }
-  return '0.1.2';
+  return '0.1.3';
 }
 
 function parseCliArgs(argv) {

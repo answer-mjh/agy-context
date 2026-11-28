@@ -1,8 +1,9 @@
-import { existsSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { basename, extname, join } from 'node:path';
 import { isPathInside, resolveBrainDir } from './env.mjs';
 import { parseTranscriptFile, localPathFromUri } from './parser.mjs';
-import { getModelSpec, estimateStepCost } from './pricing.mjs';
+import { getModelSpec, resolveModelMeta, estimateStepCost } from './pricing.mjs';
 import { getGeneratorMetadata } from './ls-rpc.mjs';
 import {
   MIN_OUTPUT_TOKENS_FOR_SPEED,
@@ -25,6 +26,30 @@ const LEGACY_ORCHESTRATOR_PLANNER_IDS = new Set([
 const LEGACY_ORCHESTRATOR_EXECUTOR_IDS = new Set([
   'MODEL_PLACEHOLDER_M669',
 ]);
+
+function isUnspecifiedModel(value) {
+  const clean = String(value || '').trim().toUpperCase();
+  return !clean || clean === 'MODEL_UNSPECIFIED' || clean === 'MODEL_PLACEHOLDER_UNSPECIFIED';
+}
+
+function readLocalOrchestratorConfigFallback() {
+  try {
+    const cfgPath = join(homedir(), '.gemini', 'config', 'config.json');
+    if (!existsSync(cfgPath)) return null;
+    const parsed = JSON.parse(readFileSync(cfgPath, 'utf8'));
+    const us = parsed?.userSettings || parsed?.userConfig?.userSettings;
+    if (!us || typeof us !== 'object' || Array.isArray(us)) return null;
+    const planModel = String(us.orchestratorModel || '').trim();
+    const executionModel = String(us.orchestratorExecutorModel || '').trim();
+    if (isUnspecifiedModel(planModel) && isUnspecifiedModel(executionModel)) return null;
+    return {
+      planModel: isUnspecifiedModel(planModel) ? '' : planModel,
+      executionModel: isUnspecifiedModel(executionModel) ? '' : executionModel,
+    };
+  } catch {
+    return null;
+  }
+}
 
 function truncate(str, maxLen = 120) {
   if (!str || typeof str !== 'string') return '';
@@ -108,6 +133,7 @@ function getTranscriptPaths(convId) {
 export function analyzeSession(convId, parsed, meta, official = null) {
   const steps = parsed.steps || [];
   const plannerSnapshots = [];
+  const checkpointRecords = [];
   const events = [];
   const allFileOps = [];
   const allCommands = [];
@@ -305,10 +331,31 @@ export function analyzeSession(convId, parsed, meta, official = null) {
       checkpointCount++;
       lastCheckpointStepIndex = Math.max(lastCheckpointStepIndex, s.stepIndex);
       if (s.model) latestModel = s.model;
+      const cpOfficial = official?.callsByStep?.get(s.stepIndex) || null;
+      const cpInput = cpOfficial ? cpOfficial.inputTokens : s.inputTokens;
+      const cpCacheRead = cpOfficial ? cpOfficial.cacheReadTokens : s.cacheReadTokens;
+      const cpCacheCreation = cpOfficial ? cpOfficial.cacheCreationTokens : 0;
+      const cpOutput = cpOfficial ? cpOfficial.outputTokens : s.outputTokens;
+      const cpModelRaw = cpOfficial?.model || cpOfficial?.responseModel || s.model || latestModel || '';
+      const cpMeta = resolveModelMeta(cpModelRaw, { at: s.createdAt });
+      const cpCost = estimateStepCost(cpModelRaw, cpInput, cpCacheRead, cpOutput, { at: s.createdAt }).cost;
+
       totalInputTokens += s.inputTokens;
       totalCacheReadTokens += s.cacheReadTokens;
       totalOutputTokens += s.outputTokens;
-      totalCost += s.cost;
+      totalCost += cpCost;
+
+      checkpointRecords.push({
+        model: cpModelRaw || 'checkpoint',
+        canonicalModelKey: cpMeta.canonicalKey,
+        labelEn: cpMeta.labelEn,
+        labelZh: cpMeta.labelZh,
+        inputTokens: cpInput,
+        cacheReadTokens: cpCacheRead,
+        cacheCreationTokens: cpCacheCreation,
+        outputTokens: cpOutput,
+        cost: cpCost,
+      });
 
       const beforePrompt = prevPromptTokens;
       const checkpointTokens = Math.max(0, officialStepTokens.get(s.stepIndex) || s.tokensEst || 0);
@@ -370,7 +417,6 @@ export function analyzeSession(convId, parsed, meta, official = null) {
       totalOutputTokens += s.outputTokens;
       plannerInputTokens += s.inputTokens;
       plannerCacheReadTokens += s.cacheReadTokens;
-      totalCost += s.cost;
       totalToolCalls += (s.toolCalls || []).length;
 
       // Prefer official streamingDuration + timeToFirstToken from language server.
@@ -567,9 +613,16 @@ export function analyzeSession(convId, parsed, meta, official = null) {
       const callThinkingPct = callOutput > 0 && callThinkingTokens > 0
         ? Math.min(100, Math.round((callThinkingTokens / callOutput) * 100))
         : 0;
-      const callCost = officialCall && callCacheCreation > 0
-        ? estimateStepCost(officialCall.responseModel || s.model, callInput + callCacheCreation, callCacheRead, callOutput).cost
-        : s.cost;
+      const stepModelRaw = s.model || officialCall?.model || officialCall?.responseModel || '';
+      const stepMeta = resolveModelMeta(stepModelRaw, { at: s.createdAt });
+      const callCost = estimateStepCost(
+        stepModelRaw || officialCall?.responseModel,
+        callInput,
+        callCacheRead,
+        callOutput,
+        { at: s.createdAt }
+      ).cost;
+      totalCost += callCost;
       const callTtftMs = officialCall ? officialCall.ttftMs : stepTtftMs;
       const callStreamExact = officialCall ? officialCall.streamingMsExact : stepStreamingExact;
       const callTotalMs = officialCall && officialCall.totalMs > 0 ? officialCall.totalMs : modelDurMs;
@@ -600,10 +653,16 @@ export function analyzeSession(convId, parsed, meta, official = null) {
         rawModelId: officialCall?.model || s.model,
         executionModel: officialCall?.executionModel || '',
         callRole: 'direct',
+        isRoleSwitch: false,
+        switchDirection: '',
         isColdCacheSwitch: false,
+        coldSwitchFreshInputTokens: 0,
         netDeltaTokens,
         isCompactionDrop,
-        modelLabel: s.modelLabel,
+        modelLabel: stepMeta.label,
+        modelLabelZh: stepMeta.labelZh,
+        modelQuotaPool: stepMeta.quotaPool,
+        canonicalModelKey: stepMeta.canonicalKey,
         contextWindow: s.contextWindow,
         maxOutput: s.maxOutput,
         durationMs: modelDurMs,
@@ -868,15 +927,22 @@ export function analyzeSession(convId, parsed, meta, official = null) {
         }
 
         snap.callRole = role;
-        if (
-          prevRole !== null &&
-          prevRole !== role &&
-          ((prevRole === 'orchestrator' && role === 'executor') ||
-            (prevRole === 'executor' && role === 'orchestrator')) &&
-          (snap.actual?.cacheReadTokens || 0) === 0 &&
-          (snap.actual?.totalPromptTokens || 0) > 0
-        ) {
-          snap.isColdCacheSwitch = true;
+        if (prevRole !== null && prevRole !== role) {
+          if (prevRole === 'orchestrator' && role === 'executor') {
+            snap.isRoleSwitch = true;
+            snap.switchDirection = 'orchestrator_to_executor';
+          } else if (prevRole === 'executor' && role === 'orchestrator') {
+            snap.isRoleSwitch = true;
+            snap.switchDirection = 'executor_to_orchestrator';
+          }
+          if (
+            snap.isRoleSwitch &&
+            (snap.actual?.cacheReadTokens || 0) === 0 &&
+            (snap.actual?.totalPromptTokens || 0) > 0
+          ) {
+            snap.isColdCacheSwitch = true;
+            snap.coldSwitchFreshInputTokens = snap.actual?.inputTokens || 0;
+          }
         }
 
         if (tools.includes('exit_plan_mode')) {
@@ -889,6 +955,8 @@ export function analyzeSession(convId, parsed, meta, official = null) {
       }
     }
   }
+
+  const modelUsage = computeModelUsage(plannerSnapshots, checkpointRecords, lastMs);
 
   // Mark slowest and largest_growth flags across planner snapshots
   if (plannerSnapshots.length > 1) {
@@ -988,7 +1056,12 @@ export function analyzeSession(convId, parsed, meta, official = null) {
     turns.push({ ...t, flags: [...t.flags] });
   }
 
-  const spec = getModelSpec(latestModel);
+  const latestSnapForMeta = plannerSnapshots[plannerSnapshots.length - 1] || null;
+  const latestOrchSnap = [...plannerSnapshots].reverse().find(sn => sn.callRole === 'orchestrator') || null;
+  const primaryModelId = (latestSnapForMeta?.callRole === 'executor' && latestOrchSnap?.model)
+    ? latestOrchSnap.model
+    : (latestModel || latestSnapForMeta?.rawModelId || '');
+  const spec = resolveModelMeta(primaryModelId, { at: lastMs || Date.now() });
   const plannerPromptAll = plannerInputTokens + plannerCacheReadTokens;
   const cacheHitRate = official?.cache?.totalPromptTokens > 0
     ? official.cache.cacheHitRate
@@ -1174,8 +1247,9 @@ export function analyzeSession(convId, parsed, meta, official = null) {
       workspaceName: meta?.workspaceName || 'Workspace',
       workspacePath: meta?.workspacePath || '',
       status: meta?.status || '',
-      model: latestModel || 'unknown',
+      model: primaryModelId || 'unknown',
       modelLabel: spec.label,
+      modelLabelZh: spec.labelZh,
       contextWindow: effectiveWindow,
       nativeContextWindow: nativeWindow,
       contextSource: official?.hasBreakdown ? 'official' : (official ? 'official-usage' : 'transcript'),
@@ -1264,6 +1338,7 @@ export function analyzeSession(convId, parsed, meta, official = null) {
       steps: plannerSnapshots,
       turns,
     },
+    modelUsage,
     events,
     allFileOps,
     allCommands,
@@ -1273,6 +1348,305 @@ export function analyzeSession(convId, parsed, meta, official = null) {
     _officialFull: official,
     _compactedAfterLatestPlanner: compactedAfterLatestPlanner,
     _latestHistoryEpoch: historyEpoch,
+  };
+}
+
+function createEmptyRoleBucket() {
+  return {
+    calls: 0,
+    models: [],
+    labelsEn: [],
+    labelsZh: [],
+    primaryLabelEn: '',
+    primaryLabelZh: '',
+    inputTokens: 0,
+    cacheReadTokens: 0,
+    cacheCreationTokens: 0,
+    outputTokens: 0,
+    thinkingTokens: 0,
+    totalPromptTokens: 0,
+    totalTokens: 0,
+    cacheHitRate: null,
+    cost: 0,
+  };
+}
+
+function computeModelUsage(plannerSnapshots, checkpointRecords, lastMs) {
+  const byModelMap = new Map();
+  const roleBuckets = {
+    orchestrator: createEmptyRoleBucket(),
+    executor: createEmptyRoleBucket(),
+    direct: createEmptyRoleBucket(),
+  };
+  const compactionBucket = createEmptyRoleBucket();
+  const compactionModelCounts = new Map();
+  const roleModelCounts = {
+    orchestrator: new Map(),
+    executor: new Map(),
+    direct: new Map(),
+  };
+  let roleSwitchCount = 0;
+  let coldCacheSwitchCount = 0;
+  let coldCacheSwitchInputTokens = 0;
+  let totalCallsCost = 0;
+  let latestOrchModel = '';
+  let latestExecModel = '';
+  let latestExplicitExec = '';
+
+  for (const sn of plannerSnapshots) {
+    const a = sn.actual || {};
+    const freshIn = Math.max(0, Number(a.inputTokens) || 0);
+    const cacheRead = Math.max(0, Number(a.cacheReadTokens) || 0);
+    const cacheCreate = Math.max(0, Number(a.cacheCreationTokens) || 0);
+    const out = Math.max(0, Number(a.outputTokens) || 0);
+    const think = Math.max(0, Number(a.thinkingOutputTokens) || 0);
+    const totalPrompt = freshIn + cacheRead + cacheCreate;
+    const totalTok = totalPrompt + out;
+    const cost = Math.max(0, Number(a.cost) || 0);
+    totalCallsCost += cost;
+
+    const rawModelId = sn.model || sn.rawModelId || sn.actualModel || 'unknown';
+    const canonicalKey = sn.canonicalModelKey || rawModelId;
+    const labelEn = sn.modelLabel || sn.actualModel || rawModelId;
+    const labelZh = sn.modelLabelZh || labelEn;
+    const quotaPool = sn.modelQuotaPool || 'other';
+    const role = sn.callRole === 'orchestrator' || sn.callRole === 'executor' ? sn.callRole : 'direct';
+
+    if (role === 'orchestrator' && rawModelId && rawModelId !== 'unknown') latestOrchModel = rawModelId;
+    if (role === 'executor' && rawModelId && rawModelId !== 'unknown') latestExecModel = rawModelId;
+    if (sn.executionModel) latestExplicitExec = sn.executionModel;
+
+    if (sn.isRoleSwitch) roleSwitchCount++;
+    if (sn.isColdCacheSwitch) {
+      coldCacheSwitchCount++;
+      coldCacheSwitchInputTokens += sn.coldSwitchFreshInputTokens || 0;
+    }
+
+    // Aggregate per-model
+    let modelRow = byModelMap.get(canonicalKey);
+    if (!modelRow) {
+      modelRow = {
+        model: rawModelId,
+        canonicalKey,
+        labelEn,
+        labelZh,
+        quotaPool,
+        roles: new Set(),
+        calls: 0,
+        inputTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        outputTokens: 0,
+        thinkingTokens: 0,
+        totalPromptTokens: 0,
+        totalTokens: 0,
+        cacheHitRate: null,
+        cost: 0,
+      };
+      byModelMap.set(canonicalKey, modelRow);
+    }
+    modelRow.roles.add(role);
+    modelRow.calls++;
+    modelRow.inputTokens += freshIn;
+    modelRow.cacheReadTokens += cacheRead;
+    modelRow.cacheCreationTokens += cacheCreate;
+    modelRow.outputTokens += out;
+    modelRow.thinkingTokens += think;
+    modelRow.totalPromptTokens += totalPrompt;
+    modelRow.totalTokens += totalTok;
+    modelRow.cost += cost;
+
+    // Aggregate per-role
+    const rb = roleBuckets[role];
+    const rc = roleModelCounts[role];
+    if (!rb.models.includes(canonicalKey)) {
+      rb.models.push(canonicalKey);
+      rb.labelsEn.push(labelEn);
+      rb.labelsZh.push(labelZh);
+    }
+    const prevCnt = rc.get(canonicalKey)?.count || 0;
+    rc.set(canonicalKey, { count: prevCnt + 1, labelEn, labelZh });
+    rb.calls++;
+    rb.inputTokens += freshIn;
+    rb.cacheReadTokens += cacheRead;
+    rb.cacheCreationTokens += cacheCreate;
+    rb.outputTokens += out;
+    rb.thinkingTokens += think;
+    rb.totalPromptTokens += totalPrompt;
+    rb.totalTokens += totalTok;
+    rb.cost += cost;
+  }
+
+  for (const role of ['orchestrator', 'executor', 'direct']) {
+    const rb = roleBuckets[role];
+    rb.cacheHitRate = rb.totalPromptTokens > 0
+      ? Math.max(0, Math.min(1, rb.cacheReadTokens / rb.totalPromptTokens))
+      : null;
+    let bestCount = -1;
+    let bestEn = '';
+    let bestZh = '';
+    for (const info of roleModelCounts[role].values()) {
+      if (info.count >= bestCount) {
+        bestCount = info.count;
+        bestEn = info.labelEn;
+        bestZh = info.labelZh;
+      }
+    }
+    rb.primaryLabelEn = bestEn;
+    rb.primaryLabelZh = bestZh;
+  }
+
+  const byModel = [...byModelMap.values()]
+    .map(row => ({
+      model: row.model,
+      canonicalKey: row.canonicalKey,
+      labelEn: row.labelEn,
+      labelZh: row.labelZh,
+      quotaPool: row.quotaPool,
+      roles: [...row.roles],
+      calls: row.calls,
+      inputTokens: row.inputTokens,
+      cacheReadTokens: row.cacheReadTokens,
+      cacheCreationTokens: row.cacheCreationTokens,
+      outputTokens: row.outputTokens,
+      thinkingTokens: row.thinkingTokens,
+      totalPromptTokens: row.totalPromptTokens,
+      totalTokens: row.totalTokens,
+      cacheHitRate: row.totalPromptTokens > 0
+        ? Math.max(0, Math.min(1, row.cacheReadTokens / row.totalPromptTokens))
+        : null,
+      cost: row.cost,
+    }))
+    .sort((a, b) => b.cost - a.cost || b.totalTokens - a.totalTokens || b.calls - a.calls);
+
+  const orch = roleBuckets.orchestrator;
+  const exec = roleBuckets.executor;
+  const hasOrchestration = orch.calls > 0 || exec.calls > 0;
+
+  let route = null;
+  let orchestratorSplit = null;
+
+  if (hasOrchestration) {
+    const localCfg = readLocalOrchestratorConfigFallback();
+    const routePlannerId = latestOrchModel || localCfg?.planModel || '';
+    const routeExecutorId = latestExecModel || latestExplicitExec || localCfg?.executionModel || '';
+
+    if (routePlannerId && routeExecutorId) {
+      const pMeta = resolveModelMeta(routePlannerId, { at: lastMs || Date.now() });
+      const eMeta = resolveModelMeta(routeExecutorId, { at: lastMs || Date.now() });
+      if (!orch.primaryLabelEn) {
+        orch.primaryLabelEn = pMeta.labelEn;
+        orch.primaryLabelZh = pMeta.labelZh;
+      }
+      if (!exec.primaryLabelEn) {
+        exec.primaryLabelEn = eMeta.labelEn;
+        exec.primaryLabelZh = eMeta.labelZh;
+      }
+      const isCrossPool = Boolean(
+        pMeta.quotaPool &&
+        eMeta.quotaPool &&
+        pMeta.quotaPool !== 'other' &&
+        eMeta.quotaPool !== 'other' &&
+        pMeta.quotaPool !== eMeta.quotaPool
+      );
+      route = {
+        plannerModel: routePlannerId,
+        executorModel: routeExecutorId,
+        plannerLabelEn: pMeta.labelEn,
+        plannerLabelZh: pMeta.labelZh,
+        executorLabelEn: eMeta.labelEn,
+        executorLabelZh: eMeta.labelZh,
+        plannerPool: pMeta.quotaPool,
+        executorPool: eMeta.quotaPool,
+        isCrossPool,
+      };
+    }
+
+    const pKey = orch.models[0] || (route ? resolveModelMeta(route.plannerModel).canonicalKey : '');
+    const eKey = exec.models[0] || (route ? resolveModelMeta(route.executorModel).canonicalKey : '');
+    const isSameModelOrchestrated = Boolean(
+      (orch.models.length === 1 && exec.models.length === 1 && orch.models[0] === exec.models[0]) ||
+      (orch.models.length === 1 && exec.calls === 0 && pKey && eKey && pKey === eKey)
+    );
+    const hasMidConversationReconfig = orch.models.length > 1 || exec.models.length > 1;
+    const isMultiModelOrchestrated = (orch.calls > 0 && exec.calls > 0) || byModel.length >= 2;
+
+    orchestratorSplit = {
+      isMultiModelOrchestrated,
+      isSameModelOrchestrated,
+      hasMidConversationReconfig,
+      isCrossPool: Boolean(route?.isCrossPool),
+      distinctModelCount: byModel.length,
+      orchestrator: orch,
+      executor: exec,
+      direct: roleBuckets.direct.calls > 0 ? roleBuckets.direct : null,
+      compaction: compactionBucket.calls > 0 ? compactionBucket : null,
+      totalCalls: plannerSnapshots.length + compactionBucket.calls,
+      totalCost: totalCallsCost + compactionBucket.cost,
+      roleSwitchCount,
+      coldCacheSwitchCount,
+      coldCacheSwitchInputTokens,
+    };
+  }
+
+  for (const cp of checkpointRecords || []) {
+    const freshIn = Math.max(0, Number(cp.inputTokens) || 0);
+    const cacheRead = Math.max(0, Number(cp.cacheReadTokens) || 0);
+    const cacheCreate = Math.max(0, Number(cp.cacheCreationTokens) || 0);
+    const out = Math.max(0, Number(cp.outputTokens) || 0);
+    const totalPrompt = freshIn + cacheRead + cacheCreate;
+    const totalTok = totalPrompt + out;
+    const cpCost = Math.max(0, Number(cp.cost) || 0);
+    const key = cp.canonicalModelKey || cp.model || 'checkpoint';
+    const labelEn = cp.labelEn || cp.model || 'Checkpoint';
+    const labelZh = cp.labelZh || labelEn;
+
+    if (!compactionBucket.models.includes(key)) {
+      compactionBucket.models.push(key);
+      compactionBucket.labelsEn.push(labelEn);
+      compactionBucket.labelsZh.push(labelZh);
+    }
+    const prevCnt = compactionModelCounts.get(key)?.count || 0;
+    compactionModelCounts.set(key, { count: prevCnt + 1, labelEn, labelZh });
+    compactionBucket.calls++;
+    compactionBucket.inputTokens += freshIn;
+    compactionBucket.cacheReadTokens += cacheRead;
+    compactionBucket.cacheCreationTokens += cacheCreate;
+    compactionBucket.outputTokens += out;
+    compactionBucket.totalPromptTokens += totalPrompt;
+    compactionBucket.totalTokens += totalTok;
+    compactionBucket.cost += cpCost;
+  }
+
+  if (compactionBucket.calls > 0) {
+    compactionBucket.cacheHitRate = compactionBucket.totalPromptTokens > 0
+      ? Math.max(0, Math.min(1, compactionBucket.cacheReadTokens / compactionBucket.totalPromptTokens))
+      : null;
+    let bestCnt = -1;
+    let bestEn = '';
+    let bestZh = '';
+    for (const info of compactionModelCounts.values()) {
+      if (info.count >= bestCnt) {
+        bestCnt = info.count;
+        bestEn = info.labelEn;
+        bestZh = info.labelZh;
+      }
+    }
+    compactionBucket.primaryLabelEn = bestEn;
+    compactionBucket.primaryLabelZh = bestZh;
+    if (orchestratorSplit) {
+      orchestratorSplit.compaction = compactionBucket;
+      orchestratorSplit.totalCalls = plannerSnapshots.length + compactionBucket.calls;
+      orchestratorSplit.totalCost = totalCallsCost + compactionBucket.cost;
+    }
+  }
+
+  return {
+    totalCost: totalCallsCost + compactionBucket.cost,
+    compaction: compactionBucket.calls > 0 ? compactionBucket : null,
+    route,
+    orchestratorSplit,
+    byModel,
   };
 }
 
@@ -1442,6 +1816,7 @@ export class SessionDetailStore {
       meta: session.meta,
       stats: session.stats,
       currentContext: session.currentContext,
+      modelUsage: session.modelUsage,
       selectedSeq: activeSeq,
       timeline: {
         steps: steps.map(s => ({
@@ -1456,6 +1831,7 @@ export class SessionDetailStore {
           netDeltaTokens: s.netDeltaTokens ?? null,
           isCompactionDrop: Boolean(s.isCompactionDrop),
           modelLabel: s.modelLabel,
+          modelLabelZh: s.modelLabelZh || s.modelLabel,
           contextWindow: s.contextWindow,
           durationMs: s.durationMs,
           callDurationMs: s.callDurationMs || s.durationMs || 0,

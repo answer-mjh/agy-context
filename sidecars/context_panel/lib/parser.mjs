@@ -313,7 +313,7 @@ export function parseTranscriptFile(filePath, options = {}) {
       const outputTokens = Math.max(0, Number(s.output_tokens) || 0);
       const totalPromptTokens = inputTokens + cacheReadTokens;
       const totalBillableTokens = totalPromptTokens + outputTokens;
-      const { cost, spec } = estimateStepCost(model, inputTokens, cacheReadTokens, outputTokens);
+      const { cost, spec } = estimateStepCost(model, inputTokens, cacheReadTokens, outputTokens, { at: createdAt });
 
       const thinking = typeof s.thinking === 'string' ? s.thinking : '';
       const content = typeof s.content === 'string' ? s.content : '';
@@ -350,6 +350,7 @@ export function parseTranscriptFile(filePath, options = {}) {
         dateKey,
         model,
         modelLabel: spec.label,
+        modelLabelZh: spec.labelZh,
         contextWindow: spec.contextWindow,
         maxOutput: spec.maxOutput,
         modelSwitched,
@@ -452,7 +453,7 @@ export function parseTranscriptFile(filePath, options = {}) {
       const outputTokens = Math.max(0, Number(s.output_tokens) || 0);
       const totalPromptTokens = inputTokens + cacheReadTokens;
       const totalBillableTokens = totalPromptTokens + outputTokens;
-      const { cost, spec } = estimateStepCost(model, inputTokens, cacheReadTokens, outputTokens);
+      const { cost, spec } = estimateStepCost(model, inputTokens, cacheReadTokens, outputTokens, { at: createdAt });
       const content = typeof s.content === 'string' ? s.content : '';
       const tokensEst = estimateTokens(content);
 
@@ -467,6 +468,7 @@ export function parseTranscriptFile(filePath, options = {}) {
         dateKey,
         model,
         modelLabel: spec.label,
+        modelLabelZh: spec.labelZh,
         contextWindow: spec.contextWindow,
         maxOutput: spec.maxOutput,
         inputTokens,

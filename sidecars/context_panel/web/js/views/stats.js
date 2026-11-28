@@ -14,10 +14,14 @@
     const cmdTotal = commands?.summary?.total || 0;
     const p = meta.pricing || {};
     const fam = session.fleet || null;
-    const version = document.body.getAttribute('data-version') || '0.1.2';
+    const version = document.body.getAttribute('data-version') || '0.1.3';
     const isZh = getLang() === 'zh';
+    const modelDisplay = (isZh ? meta.modelLabelZh : meta.modelLabel) || meta.modelLabel || meta.model;
+    const route = session.modelUsage?.route || null;
+    const routePlanner = route ? ((isZh ? route.plannerLabelZh : route.plannerLabelEn) || route.plannerModel) : '';
+    const routeExecutor = route ? ((isZh ? route.executorLabelZh : route.executorLabelEn) || route.executorModel) : '';
 
-    const pricingTitle = `${t('pricingHint')}\n${meta.modelLabel || meta.model}\nIn: $${p.inputPerM}/1M · Cache: $${p.cacheReadPerM}/1M · Out: $${p.outputPerM}/1M${p.isFallback ? ' (fallback)' : ''}`;
+    const pricingTitle = `${t('pricingHint')}\n${modelDisplay}\nIn: $${p.inputPerM}/1M · Cache: $${p.cacheReadPerM}/1M · Out: $${p.outputPerM}/1M${p.isFallback ? ' (fallback)' : ''}`;
     const primarySpeed = tm.latestOutputTokensPerSec > 0 ? tm.latestOutputTokensPerSec : (tm.outputTokensPerSec || 0);
     const showAvg = tm.latestOutputTokensPerSec > 0 && tm.outputTokensPerSec > 0 && tm.latestOutputTokensPerSec !== tm.outputTokensPerSec;
     const speedLines = [
@@ -70,8 +74,9 @@
             </div>
           </div>
 
-          <!-- 2x2 Detailed Metadata Grid -->
+          <!-- Detailed Metadata Grid (Left: I/O + Tools + Commands | Right: Model & Billing) -->
           <div class="dsh-meta-grid">
+            <div class="dsh-meta-col">
             <!-- Input / Output -->
             <div class="dsh-meta-block">
               <div class="dsh-meta-head">
@@ -138,6 +143,8 @@
               </div>
             </div>
 
+            </div>
+            <div class="dsh-meta-col">
             <!-- Model & Billing -->
             <div class="dsh-meta-block">
               <div class="dsh-meta-head">
@@ -150,13 +157,21 @@
               <div class="dsh-plugin-rows" style="gap:4px">
                 <div class="dsh-plugin-row">
                   <span class="dsh-plugin-key">${escHtml(t('currentModel'))}</span>
-                  <span class="dsh-plugin-val mono">${escHtml(meta.modelLabel || meta.model)}</span>
+                  <span class="dsh-plugin-val mono" title="${escHtml(meta.model || '')}">${escHtml(modelDisplay)}</span>
                 </div>
                 <div class="dsh-plugin-row" style="font-size:11px;color:var(--ink-muted)">
                   <span>In ${escHtml(fmtTokens(ts.inputTokens))} · Cache ${escHtml(fmtTokens(ts.cacheReadTokens))}</span>
                   <span class="mono">Out ${escHtml(fmtTokens(ts.outputTokens))}</span>
                 </div>
+                ${route ? `
+                  <div class="orch-route-pill" data-cross-pool="${route.isCrossPool ? 'true' : 'false'}" title="${escHtml(`${routePlanner} → ${routeExecutor}`)}">
+                    <span class="orch-route-label">${escHtml(t('orchRouteBadge'))}</span>
+                    <span class="orch-route-pair">${escHtml(routePlanner)} <span class="orch-route-arrow" aria-hidden="true">→</span> ${escHtml(routeExecutor)}</span>
+                    ${route.isCrossPool ? `<span class="orch-route-badge">${escHtml(t('orchCrossPool'))}</span>` : ''}
+                  </div>
+                ` : ''}
               </div>
+            </div>
             </div>
           </div>
         </div>
@@ -295,6 +310,7 @@
     const nativeWindow = Number(currentContext?.nativeContextWindow || meta.contextWindow || 0);
     const pctColor = usagePct >= 80 ? 'var(--danger)' : usagePct >= 60 ? 'var(--warn)' : 'var(--ink)';
     const isZh = AGY.i18n.getLang() === 'zh';
+    const modelDisplay = (isZh ? meta.modelLabelZh : meta.modelLabel) || meta.modelLabel || meta.model;
     const accessLabel = String(meta.contextSource || '').startsWith('official')
       ? (isZh ? '官方' : 'official')
       : (isZh ? '估算' : 'estimated');
@@ -303,7 +319,7 @@
       <div class="card">
         <div class="card-header">
           <span class="card-title">◔ ${escHtml(t('currentContext'))}</span>
-          <span class="card-subtitle mono">${escHtml(meta.modelLabel || meta.model)}</span>
+          <span class="card-subtitle mono">${escHtml(modelDisplay)}</span>
         </div>
         <div class="dsh-ctx-head-stats">
           <div>

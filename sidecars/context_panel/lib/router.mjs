@@ -34,6 +34,7 @@ export const STATIC_WEB_PATHS = [
   '/js/views/insights.js',
   '/js/views/fleet.js',
   '/js/views/stats.js',
+  '/js/views/models.js',
   '/js/views/timeline.js',
   '/js/views/calls.js',
   '/js/views/browser.js',
@@ -59,7 +60,7 @@ function normalizeQuery(raw) {
   return out;
 }
 
-export function createRouter({ version = '0.1.2' } = {}) {
+export function createRouter({ version = '0.1.3' } = {}) {
   const projectionStore = new ProjectionStore();
   const detailStore = new SessionDetailStore();
   const fleetStore = new FleetStore(projectionStore, detailStore);
@@ -77,6 +78,7 @@ export function createRouter({ version = '0.1.2' } = {}) {
       '/js/views/insights.js',
       '/js/views/fleet.js',
       '/js/views/stats.js',
+      '/js/views/models.js',
       '/js/views/timeline.js',
       '/js/views/calls.js',
       '/js/views/browser.js',

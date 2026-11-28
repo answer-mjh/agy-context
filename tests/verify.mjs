@@ -13,6 +13,7 @@ import {
   parseUserQuotaSummary,
   resolveWeeklyQuotaWindow,
 } from '../sidecars/context_panel/lib/quota.mjs';
+import { estimateStepCost, resolveModelMeta } from '../sidecars/context_panel/lib/pricing.mjs';
 
 async function run() {
   // 0. Unit checks for official streamingDuration & TTFT parsing
@@ -147,6 +148,11 @@ async function run() {
     `Expected cacheHitRate to exclude CHECKPOINT (0.975), got ${postCompactAnalyzed.stats.tokens.cacheHitRate}`
   );
   assert.equal(postCompactAnalyzed.stats.tokens.billableTotal, 813500);
+  assert.equal(postCompactAnalyzed.modelUsage?.compaction?.calls, 1);
+  assert.ok(
+    Math.abs((postCompactAnalyzed.stats?.context?.cost || 0) - (postCompactAnalyzed.modelUsage?.totalCost || 0)) < 1e-9,
+    'post-compact stats.context.cost must match modelUsage.totalCost'
+  );
   console.log(`[verify] Post-compaction context reset OK: ${postCompactAnalyzed.currentContext.composition.total} tokens`);
 
   // 0c. Weekly quota parsing & window resolution unit tests
@@ -336,7 +342,95 @@ async function run() {
   );
   assert.equal(handoffAnalyzed.timeline.steps[0].callRole, 'orchestrator');
   assert.equal(handoffAnalyzed.timeline.steps[1].callRole, 'executor');
-  console.log('[verify] Per-call telemetry diagnostics & attribution OK');
+
+  // 0e. Model directory, localized names, dated pricing & modelUsage card aggregation
+  const neonMeta = resolveModelMeta('gemini-4-neon-high');
+  assert.equal(neonMeta.canonicalKey, 'MODEL_PLACEHOLDER_M532');
+  assert.equal(neonMeta.labelEn, 'Gemini 4 Neon (High)');
+  assert.equal(neonMeta.labelZh, 'Gemini 4 Neon (高)');
+  assert.equal(neonMeta.quotaPool, 'gemini');
+  assert.equal(neonMeta.inputPerM, 3);
+  assert.equal(neonMeta.cacheReadPerM, 0.15);
+  assert.equal(neonMeta.outputPerM, 15);
+
+  const m532Meta = resolveModelMeta('MODEL_PLACEHOLDER_M532');
+  assert.equal(m532Meta.labelZh, 'Gemini 4 Neon (高)');
+  const m525Meta = resolveModelMeta('MODEL_PLACEHOLDER_M525');
+  assert.equal(m525Meta.labelZh, 'Gemini 4 Hydrogen (高)');
+  assert.equal(m525Meta.inputPerM, 1.5);
+  const m537Meta = resolveModelMeta('MODEL_PLACEHOLDER_M537');
+  assert.equal(m537Meta.pricingProvenance, 'mapped_base');
+  assert.equal(m537Meta.inputPerM, 3);
+  const m669Meta = resolveModelMeta('MODEL_PLACEHOLDER_M669');
+  assert.equal(m669Meta.pricingProvenance, 'mapped_base');
+  assert.equal(m669Meta.inputPerM, 1.5);
+  const opus55Meta = resolveModelMeta('claude-opus-5-5-high');
+  assert.equal(opus55Meta.labelZh, 'Claude Opus 5.5 (高)');
+  assert.equal(opus55Meta.quotaPool, 'premium');
+  assert.equal(opus55Meta.inputPerM, 4);
+
+  const carbonIntro = estimateStepCost('gemini-4-carbon-high', 1_000_000, 0, 0, { at: '2026-11-28T00:00:00Z' });
+  const carbonStd = estimateStepCost('gemini-4-carbon-high', 1_000_000, 0, 0, { at: '2026-12-01T00:00:00Z' });
+  assert.equal(carbonIntro.cost, 2);
+  assert.equal(carbonStd.cost, 4);
+
+  // Verify cross-model orchestrator attribution + cold cache switch from callsAnalyzed
+  assert.ok(callsAnalyzed.modelUsage?.route, 'expected route on orchestrated session');
+  assert.equal(callsAnalyzed.modelUsage.route.plannerLabelZh, 'Gemini 4 Neon (高)');
+  assert.equal(callsAnalyzed.modelUsage.route.executorLabelZh, 'Gemini 4 Hydrogen (高)');
+  assert.equal(callsAnalyzed.modelUsage.route.isCrossPool, false);
+  const split = callsAnalyzed.modelUsage.orchestratorSplit;
+  assert.ok(split && split.isMultiModelOrchestrated);
+  assert.equal(split.orchestrator.calls, 2);
+  assert.equal(split.executor.calls, 1);
+  assert.equal(split.coldCacheSwitchCount, 1);
+  assert.equal(split.coldCacheSwitchInputTokens, 13000);
+  assert.equal(callsAnalyzed.modelUsage.byModel.length, 2);
+  assert.equal(callsAnalyzed.meta.model, 'gemini-4-neon-high', 'primary model should protect orchestrator');
+
+  // Mid-conversation reconfig + cross-pool session
+  const reconfigAnalyzed = analyzeSession(
+    'model-usage-reconfig-cross-pool',
+    {
+      mtimeMs: Date.now(),
+      size: 600,
+      isFull: true,
+      steps: [
+        { stepIndex: 1, turnIndex: 1, type: 'USER_INPUT', createdAt: '2026-11-27T10:00:00Z', createdMs: 1700000000000, cleanText: 'plan', rawText: 'plan', tokensEst: 20, mediaTokensEst: 0 },
+        { stepIndex: 2, turnIndex: 1, type: 'PLANNER_RESPONSE', createdAt: '2026-11-27T10:00:05Z', createdMs: 1700000005000, model: 'gemini-4-neon-high', inputTokens: 1000, cacheReadTokens: 0, outputTokens: 100, totalPromptTokens: 1000, totalBillableTokens: 1100, cost: 0, thinkingTokensEst: 0, answerTokensEst: 100, toolCallTokensEst: 0, toolCalls: [{ callIndex: 0, name: 'exit_plan_mode', args: {}, argsTokensEst: 10 }] },
+        { stepIndex: 3, turnIndex: 1, type: 'PLANNER_RESPONSE', createdAt: '2026-11-27T10:00:10Z', createdMs: 1700000010000, model: 'gemini-4-hydrogen-high', inputTokens: 2000, cacheReadTokens: 0, outputTokens: 200, totalPromptTokens: 2000, totalBillableTokens: 2200, cost: 0, thinkingTokensEst: 0, answerTokensEst: 200, toolCallTokensEst: 0, toolCalls: [{ callIndex: 0, name: 'enter_plan_mode', args: {}, argsTokensEst: 10 }] },
+        { stepIndex: 4, turnIndex: 1, type: 'PLANNER_RESPONSE', createdAt: '2026-11-27T10:00:15Z', createdMs: 1700000015000, model: 'claude-opus-5-5-high', inputTokens: 3000, cacheReadTokens: 0, outputTokens: 300, totalPromptTokens: 3000, totalBillableTokens: 3300, cost: 0, thinkingTokensEst: 0, answerTokensEst: 300, toolCallTokensEst: 0, toolCalls: [{ callIndex: 0, name: 'exit_plan_mode', args: {}, argsTokensEst: 10 }] },
+        { stepIndex: 5, turnIndex: 1, type: 'PLANNER_RESPONSE', createdAt: '2026-11-27T10:00:20Z', createdMs: 1700000020000, model: 'gemini-4-hydrogen-high', inputTokens: 4000, cacheReadTokens: 0, outputTokens: 400, totalPromptTokens: 4000, totalBillableTokens: 4400, cost: 0, thinkingTokensEst: 0, answerTokensEst: 400, toolCallTokensEst: 0, toolCalls: [] },
+      ],
+    },
+    { title: 'reconfig-cross-pool' },
+    null
+  );
+  assert.equal(reconfigAnalyzed.modelUsage.orchestratorSplit.hasMidConversationReconfig, true);
+  assert.equal(reconfigAnalyzed.modelUsage.route.isCrossPool, true);
+  assert.equal(reconfigAnalyzed.modelUsage.route.plannerPool, 'premium');
+  assert.equal(reconfigAnalyzed.modelUsage.route.executorPool, 'gemini');
+
+  // Single-model direct session
+  const singleDirect = analyzeSession(
+    'single-direct-session',
+    {
+      mtimeMs: Date.now(),
+      size: 200,
+      isFull: true,
+      steps: [
+        { stepIndex: 1, turnIndex: 1, type: 'USER_INPUT', createdAt: '2026-11-27T10:00:00Z', createdMs: 1700000000000, cleanText: 'hi', rawText: 'hi', tokensEst: 10, mediaTokensEst: 0 },
+        { stepIndex: 2, turnIndex: 1, type: 'PLANNER_RESPONSE', createdAt: '2026-11-27T10:00:05Z', createdMs: 1700000005000, model: 'gemini-4-neon-high', inputTokens: 500, cacheReadTokens: 4500, outputTokens: 200, totalPromptTokens: 5000, totalBillableTokens: 5200, cost: 0, thinkingTokensEst: 0, answerTokensEst: 200, toolCallTokensEst: 0, toolCalls: [] },
+      ],
+    },
+    { title: 'single-direct' },
+    null
+  );
+  assert.equal(singleDirect.modelUsage.route, null);
+  assert.equal(singleDirect.modelUsage.orchestratorSplit, null);
+  assert.equal(singleDirect.modelUsage.byModel.length, 1);
+  assert.equal(singleDirect.modelUsage.byModel[0].labelZh, 'Gemini 4 Neon (高)');
+  console.log('[verify] Per-call telemetry diagnostics, pricing & modelUsage OK');
 
   const router = createRouter({ version: '0.1.0-test' });
   const server = await startStandaloneServer(router, { port: 0, host: '127.0.0.1' });
@@ -451,8 +545,23 @@ async function run() {
           console.log(`[verify] Second distinct session OK: id=${secondId.slice(0, 8)}, billable=${secondPayload.session.stats.tokens.billableTotal}`);
         }
       }
-      const callsAssetRes = await fetch(`${server.url}/js/views/calls.js`);
+      const [callsAssetRes, modelsAssetRes] = await Promise.all([
+        fetch(`${server.url}/js/views/calls.js`),
+        fetch(`${server.url}/js/views/models.js`),
+      ]);
       assert.equal(callsAssetRes.status, 200);
+      assert.equal(modelsAssetRes.status, 200);
+      assert.ok(s.modelUsage && Array.isArray(s.modelUsage.byModel), 'session modelUsage missing');
+      assert.ok(
+        Math.abs((s.stats?.context?.cost || 0) - (s.modelUsage.totalCost || 0)) < 1e-6,
+        `stats.context.cost (${s.stats?.context?.cost}) != modelUsage.totalCost (${s.modelUsage.totalCost})`
+      );
+      if (s.modelUsage.orchestratorSplit) {
+        assert.ok(
+          Math.abs((s.stats?.context?.cost || 0) - (s.modelUsage.orchestratorSplit.totalCost || 0)) < 1e-6,
+          `stats.context.cost (${s.stats?.context?.cost}) != orchestratorSplit.totalCost (${s.modelUsage.orchestratorSplit.totalCost})`
+        );
+      }
       const firstCallSnap = s.timeline.steps[0];
       assert.ok(firstCallSnap.actualModel, 'actualModel missing on timeline step');
       assert.ok(['direct', 'orchestrator', 'executor'].includes(firstCallSnap.callRole));
