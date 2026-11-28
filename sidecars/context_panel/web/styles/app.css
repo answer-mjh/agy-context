@@ -191,8 +191,27 @@ button, input, select {
   gap: 14px;
 }
 
+.page-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+}
+
+.ctx-below-fold {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 320px;
+}
+
+.list-more-wrap {
+  display: flex;
+  justify-content: center;
+  padding-top: 6px;
+}
+
 body[data-view="aux"] .topbar { padding: 8px 10px; }
 body[data-view="aux"] .main-content { padding: 10px 10px 24px; gap: 10px; }
+body[data-view="aux"] .page-pane { gap: 10px; }
 body[data-view="aux"] .session-select { max-width: 170px; }
 
 /* ═══ Cards & Grids ═══ */

@@ -64,38 +64,45 @@ export function createRouter({ version = '0.1.3' } = {}) {
   const projectionStore = new ProjectionStore();
   const detailStore = new SessionDetailStore();
   const fleetStore = new FleetStore(projectionStore, detailStore);
+  const htmlTemplateCache = new Map();
 
   function renderHtml(viewMode) {
-    const htmlPath = join(WEB_ROOT, 'index.html');
-    let html = readFileSync(htmlPath, 'utf8');
-    const cssParts = ['/styles/theme.css', '/styles/app.css'].map(rel =>
-      readFileSync(resolve(WEB_ROOT, `.${rel}`), 'utf8')
-    );
-    const jsFiles = [
-      '/js/i18n.js',
-      '/js/host-bridge.js',
-      '/js/charts.js',
-      '/js/views/insights.js',
-      '/js/views/fleet.js',
-      '/js/views/stats.js',
-      '/js/views/models.js',
-      '/js/views/timeline.js',
-      '/js/views/calls.js',
-      '/js/views/browser.js',
-      '/js/views/events.js',
-      '/js/views/files.js',
-      '/js/views/commands.js',
-      '/js/views/settings.js',
-      '/js/main.js',
-    ];
-    const jsParts = jsFiles.map(rel =>
-      `/* ${rel} */\n` + readFileSync(resolve(WEB_ROOT, `.${rel}`), 'utf8').replace(/<\/script/gi, '<\\/script')
-    );
-    html = html
-      .replace('__INLINE_CSS__', () => cssParts.join('\n'))
-      .replace('__INLINE_JS__', () => jsParts.join('\n;\n'))
-      .replace(/__AGY_VIEW_MODE__/g, viewMode)
-      .replace(/__AGY_VERSION__/g, version);
+    let template = htmlTemplateCache.get(viewMode);
+    if (!template) {
+      const htmlPath = join(WEB_ROOT, 'index.html');
+      const rawHtml = readFileSync(htmlPath, 'utf8');
+      const cssParts = ['/styles/theme.css', '/styles/app.css'].map(rel =>
+        readFileSync(resolve(WEB_ROOT, `.${rel}`), 'utf8')
+      );
+      const jsFiles = [
+        '/js/i18n.js',
+        '/js/host-bridge.js',
+        '/js/charts.js',
+        '/js/views/insights.js',
+        '/js/views/fleet.js',
+        '/js/views/stats.js',
+        '/js/views/models.js',
+        '/js/views/timeline.js',
+        '/js/views/calls.js',
+        '/js/views/browser.js',
+        '/js/views/events.js',
+        '/js/views/files.js',
+        '/js/views/commands.js',
+        '/js/views/settings.js',
+        '/js/main.js',
+      ];
+      const jsParts = jsFiles.map(rel =>
+        `/* ${rel} */\n` + readFileSync(resolve(WEB_ROOT, `.${rel}`), 'utf8').replace(/<\/script/gi, '<\\/script')
+      );
+      template = rawHtml
+        .replace('__INLINE_CSS__', () => cssParts.join('\n'))
+        .replace('__INLINE_JS__', () => jsParts.join('\n;\n'))
+        .replace(/__AGY_VIEW_MODE__/g, viewMode)
+        .replace(/__AGY_VERSION__/g, version);
+      htmlTemplateCache.set(viewMode, template);
+    }
+    const prefsJson = JSON.stringify(loadPrefs()).replace(/</g, '\\u003c');
+    const html = template.replace('=__AGY_INIT_PREFS__;', () => `=${prefsJson};`);
     return {
       status: 200,
       contentType: 'text/html; charset=utf-8',
@@ -140,6 +147,12 @@ export function createRouter({ version = '0.1.3' } = {}) {
     const q = normalizeQuery(rawQuery);
     const force = q.force === '1' || q.force === 'true';
     const data = await projectionStore.getInsights(q);
+    if (detailStore.lru.size === 0 && data.sessions?.[0]?.id) {
+      const topSess = data.sessions[0];
+      setImmediate(() => {
+        void detailStore.load(topSess.id, topSess).catch(() => {});
+      });
+    }
     const rev = computeEtag({
       kpi: data.kpi,
       sessions: data.sessions.map(s => [s.id, s.lastMs, s.billableTokens]),
@@ -177,11 +190,10 @@ export function createRouter({ version = '0.1.3' } = {}) {
   async function handleSession(rawQuery) {
     const q = normalizeQuery(rawQuery);
     const force = q.force === '1' || q.force === 'true';
-    if (force) {
-      await projectionStore.refresh(true);
-    }
-    const sessions = await projectionStore.listSessions();
-    const sessionOptions = mapSessionOptions(sessions);
+    const sessions = force
+      ? (await projectionStore.refresh(true), await projectionStore.listSessions())
+      : await projectionStore.listSessionsFast();
+    const sessionOptions = q.omitSessions === '1' ? [] : mapSessionOptions(sessions);
     const convId = (q.id || '').trim();
     if (!convId) {
       return {
@@ -201,7 +213,7 @@ export function createRouter({ version = '0.1.3' } = {}) {
     const stepSeq = q.step !== undefined && q.step !== '' ? Number(q.step) : -1;
     const [overview, fleetSummary] = await Promise.all([
       detailStore.getOverview(convId, meta, Number.isFinite(stepSeq) ? stepSeq : -1, { force }),
-      fleetStore.getSummary(convId).catch(() => null),
+      fleetStore.getSummary(convId, sessions).catch(() => null),
     ]);
 
     if (!overview) {
@@ -306,7 +318,7 @@ export function createRouter({ version = '0.1.3' } = {}) {
         headers: { 'Cache-Control': 'no-cache' },
       };
     }
-    const sessions = await projectionStore.listSessions();
+    const sessions = await projectionStore.listSessionsFast();
     const meta = sessions.find(s => s.id === convId) || null;
     const seq = q.step !== undefined && q.step !== '' ? Number(q.step) : -1;
     const baseline = q.baseline === 'prev_step' ? 'prev_step' : 'prev_turn';

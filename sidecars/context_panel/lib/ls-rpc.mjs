@@ -18,6 +18,7 @@ const QUOTA_CACHE_TTL_MS = 30_000;
 const SERVICE_PATH = '/exa.language_server_pb.LanguageServerService';
 
 const responseCache = new Map();
+const inFlightMetadata = new Map();
 let quotaCache = null;
 
 function positiveInt(value, fallback = 0) {
@@ -77,6 +78,7 @@ export function getLsStatus() {
 
 export function clearLsCache() {
   responseCache.clear();
+  inFlightMetadata.clear();
   quotaCache = null;
 }
 
@@ -190,27 +192,39 @@ export async function getGeneratorMetadata(cascadeId, options = {}) {
   if (!options.force && cached && now - cached.at <= ttlMs) {
     return cached.value;
   }
-
-  try {
-    const response = await rpcCall('GetCascadeTrajectoryGeneratorMetadata', {
-      cascadeId: id,
-      metadata: {
-        ideName: 'antigravity',
-        extensionName: 'antigravity',
-      },
-    }, {
-      timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-      signal: options.signal,
-    });
-    const value = Array.isArray(response?.generatorMetadata)
-      ? response.generatorMetadata.filter((item) => item && typeof item === 'object' && !Array.isArray(item))
-      : [];
-    responseCache.set(id, { at: now, value });
-    return value;
-  } catch {
-    if (cached) return cached.value;
-    return [];
+  if (!options.force && inFlightMetadata.has(id)) {
+    return inFlightMetadata.get(id);
   }
+
+  const promise = (async () => {
+    try {
+      const response = await rpcCall('GetCascadeTrajectoryGeneratorMetadata', {
+        cascadeId: id,
+        metadata: {
+          ideName: 'antigravity',
+          extensionName: 'antigravity',
+        },
+      }, {
+        timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+        signal: options.signal,
+      });
+      const value = Array.isArray(response?.generatorMetadata)
+        ? response.generatorMetadata.filter((item) => item && typeof item === 'object' && !Array.isArray(item))
+        : [];
+      responseCache.set(id, { at: Date.now(), value });
+      return value;
+    } catch {
+      if (cached) return cached.value;
+      return [];
+    } finally {
+      if (inFlightMetadata.get(id) === promise) {
+        inFlightMetadata.delete(id);
+      }
+    }
+  })();
+
+  inFlightMetadata.set(id, promise);
+  return promise;
 }
 
 /**

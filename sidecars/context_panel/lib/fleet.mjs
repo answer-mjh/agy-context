@@ -337,9 +337,9 @@ export class FleetStore {
     return { delegations, sends, messages, manageEntries, firstInbound };
   }
 
-  async getSummary(currentId) {
+  async getSummary(currentId, preloadedSessions = null) {
     const [sessions, metaMap] = await Promise.all([
-      this.projectionStore.listSessions(),
+      Array.isArray(preloadedSessions) ? Promise.resolve(preloadedSessions) : this.projectionStore.listSessions(),
       this.getMetaMap(),
     ]);
     const family = resolveFamily(currentId, sessions, metaMap);

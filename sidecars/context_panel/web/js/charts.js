@@ -261,13 +261,34 @@
   function renderTimingRibbonHtml(steps, totalActiveMs) {
     const { fmtDuration, escHtml } = AGY.i18n;
     const list = steps || [];
-    const totalDur = Math.max(1, list.reduce((s, x) => s + Math.max(1, x.durationMs || 0), 0));
+    let segments = [];
+    if (list.length > 120) {
+      const bucketCount = 120;
+      for (let b = 0; b < bucketCount; b++) {
+        const start = Math.floor((b * list.length) / bucketCount);
+        const end = Math.floor(((b + 1) * list.length) / bucketCount);
+        if (end <= start) continue;
+        let dur = 0;
+        for (let k = start; k < end; k++) {
+          dur += Math.max(1, list[k].durationMs || 0);
+        }
+        const firstSeq = list[start].seq + 1;
+        const lastSeq = list[end - 1].seq + 1;
+        segments.push({
+          label: firstSeq === lastSeq ? `#${firstSeq}` : `#${firstSeq}–#${lastSeq}`,
+          durationMs: dur,
+        });
+      }
+    } else {
+      segments = list.map(s => ({ label: `#${s.seq + 1}`, durationMs: s.durationMs || 0 }));
+    }
+    const totalDur = Math.max(1, segments.reduce((s, x) => s + Math.max(1, x.durationMs || 0), 0));
     const palette = ['var(--time-model)', 'var(--time-thinking)', 'var(--time-tool)', 'var(--time-tool-arg)', 'var(--time-reply)'];
-    const segs = list.length > 0
-      ? list.map((s, idx) => {
+    const segs = segments.length > 0
+      ? segments.map((s, idx) => {
           const w = Math.max(0.6, ((s.durationMs || 1) / totalDur) * 100);
           const col = palette[idx % palette.length];
-          return `<div style="width:${w.toFixed(2)}%;height:100%;background:${col}" title="#${s.seq + 1}: ${escHtml(fmtDuration(s.durationMs || 0))}"></div>`;
+          return `<div style="width:${w.toFixed(2)}%;height:100%;background:${col}" title="${escHtml(s.label)}: ${escHtml(fmtDuration(s.durationMs || 0))}"></div>`;
         }).join('')
       : `<div style="width:100%;height:100%;background:var(--surface-well)"></div>`;
 
@@ -500,20 +521,24 @@
           svg += `<rect x="${cx - barSlot / 2 + 1}" y="${padT - 4}" width="${barSlot - 2}" height="${plotH + 8}" rx="4" fill="var(--accent-soft)"/>`;
         }
 
+        const nonZeroDeltaCats = CAT_META.filter(c => (it.delta?.[c.key] || 0) !== 0);
+        const singleSeg = nonZeroDeltaCats.length <= 1;
         let posAcc = 0;
         let negAcc = 0;
-        for (const c of CAT_META) {
+        for (const c of nonZeroDeltaCats) {
           const v = it.delta?.[c.key] || 0;
           if (v > 0) {
             const h = (v / totalRange) * plotH;
             const y = zeroY - ((posAcc + v) / totalRange) * plotH;
             posAcc += v;
+            if (h < 0.5 && !singleSeg) continue;
             svg += `<rect x="${x}" y="${y.toFixed(1)}" width="${barW}" height="${Math.max(1, h).toFixed(1)}" fill="${c.color}"/>`;
           } else if (v < 0) {
             const av = Math.abs(v);
             const h = (av / totalRange) * plotH;
             const y = zeroY + (negAcc / totalRange) * plotH;
             negAcc += av;
+            if (h < 0.5 && !singleSeg) continue;
             svg += `<rect x="${x}" y="${y.toFixed(1)}" width="${barW}" height="${Math.max(1, h).toFixed(1)}" fill="${c.color}" fill-opacity="0.72"/>`;
           }
         }
@@ -548,13 +573,15 @@
           svg += `<rect x="${cx - barSlot / 2 + 1}" y="${padT - 4}" width="${barSlot - 2}" height="${plotH + 8}" rx="4" fill="var(--accent-soft)"/>`;
         }
 
+        const nonZeroCats = CAT_META.filter(c => Math.max(0, it.composition?.[c.key] || 0) > 0);
+        const singleSeg = nonZeroCats.length <= 1;
         let acc = 0;
-        for (const c of CAT_META) {
+        for (const c of nonZeroCats) {
           const val = Math.max(0, it.composition?.[c.key] || 0);
-          if (val <= 0) continue;
           const h = (val / maxVal) * plotH;
           const y = padT + plotH - ((acc + val) / maxVal) * plotH;
           acc += val;
+          if (h < 0.5 && !singleSeg) continue;
           svg += `<rect x="${x}" y="${y.toFixed(1)}" width="${barW}" height="${Math.max(1, h).toFixed(1)}" fill="${c.color}"/>`;
         }
 
@@ -577,24 +604,48 @@
   }
 
   function bindTimelineEvents(container, items, getSeq, buildTooltipHtml, onHover, onPin) {
-    container.querySelectorAll('.tl-hit').forEach(hit => {
+    const svg = container.querySelector('svg');
+    if (!svg) return;
+    let lastHoveredIdx = -1;
+
+    const findIdx = (ev) => {
+      const hit = ev.target && ev.target.closest ? ev.target.closest('.tl-hit') : null;
+      if (!hit) return -1;
       const idx = Number(hit.getAttribute('data-idx'));
+      return Number.isInteger(idx) && idx >= 0 && idx < items.length ? idx : -1;
+    };
+
+    svg.addEventListener('mousemove', (ev) => {
+      const idx = findIdx(ev);
+      if (idx < 0) {
+        if (lastHoveredIdx !== -1) {
+          lastHoveredIdx = -1;
+          AGY.bridge.hideTooltip();
+          if (onHover) onHover(-1, null);
+        }
+        return;
+      }
       const it = items[idx];
-      const seq = getSeq(it);
-      hit.addEventListener('mousemove', (ev) => {
-        AGY.bridge.showTooltip(ev, buildTooltipHtml(it));
-      });
-      hit.addEventListener('mouseenter', () => {
-        if (onHover) onHover(seq, it);
-      });
-      hit.addEventListener('click', () => {
-        if (onPin) onPin(seq, it);
-      });
+      AGY.bridge.showTooltip(ev, buildTooltipHtml(it));
+      if (idx !== lastHoveredIdx) {
+        lastHoveredIdx = idx;
+        if (onHover) onHover(getSeq(it), it);
+      }
     });
 
-    container.addEventListener('mouseleave', () => {
+    svg.addEventListener('click', (ev) => {
+      const idx = findIdx(ev);
+      if (idx < 0) return;
+      const it = items[idx];
+      if (onPin) onPin(getSeq(it), it);
+    });
+
+    svg.addEventListener('mouseleave', () => {
       AGY.bridge.hideTooltip();
-      if (onHover) onHover(-1, null);
+      if (lastHoveredIdx !== -1) {
+        lastHoveredIdx = -1;
+        if (onHover) onHover(-1, null);
+      }
     });
   }
 

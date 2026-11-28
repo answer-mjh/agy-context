@@ -9,7 +9,9 @@
     const search = (state.search || '').trim().toLowerCase();
     const sortBy = state.sortBy || 'ops';
     const expanded = state.expanded || new Set();
+    const limit = Math.max(50, Number(state?.limit) || 50);
     let isCollapsed = Boolean(state?.collapsed);
+    let bodyBuilt = !isCollapsed;
 
     let list = (data.files || []).filter(f => {
       if (activeKind !== 'all' && !(f[activeKind] > 0)) return false;
@@ -23,6 +25,8 @@
       return b.totalOps - a.totalOps || a.name.localeCompare(b.name);
     });
 
+    const visible = list.slice(0, limit);
+    const remaining = Math.max(0, list.length - visible.length);
     const fileByPath = new Map(list.map(f => [f.path, f]));
 
     const buildOpsHtml = (f) => `
@@ -43,12 +47,95 @@
       </div>
     `;
 
-    const bindOpsJumpButtons = (scope) => {
-      scope.querySelectorAll('[data-jump-file-step]').forEach(btn => {
-        btn.addEventListener('click', () => {
-          const [seqStr, stepStr] = (btn.getAttribute('data-jump-file-step') || '0:0').split(':');
+    const buildBodyHtml = () => `
+      <div class="filter-bar">
+        <input class="input" id="fa-search" type="search" style="flex:1;min-width:160px" placeholder="${escHtml(t('searchFiles'))}" value="${escHtml(state.search || '')}"/>
+        <select class="select" id="fa-sort" style="font-size:11px">
+          <option value="ops" ${sortBy === 'ops' ? 'selected' : ''}>Ops</option>
+          <option value="changes" ${sortBy === 'changes' ? 'selected' : ''}>+/- Lines</option>
+          <option value="name" ${sortBy === 'name' ? 'selected' : ''}>Name</option>
+        </select>
+      </div>
+
+      ${list.length === 0
+        ? `<div class="empty-state">${escHtml(t('noFiles'))}</div>`
+        : `<div class="list-scroll">
+            ${visible.map(f => {
+              const isOpen = expanded.has(f.path);
+              return `
+                <div class="row-item">
+                  <div class="row-head" style="cursor:pointer" data-toggle-file="${escHtml(f.path)}">
+                    <div style="display:flex;align-items:center;gap:7px;min-width:0;flex:1">
+                      <span data-file-chev style="color:var(--ink-muted);font-size:10px">${isOpen ? '▾' : '▸'}</span>
+                      <span style="font-weight:600;font-size:12px" title="${escHtml(f.path)}">${escHtml(f.name)}</span>
+                      <span class="card-subtitle mono" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(f.path)}</span>
+                    </div>
+                    <div class="filter-bar">
+                      ${f.read > 0 ? `<span class="pill mono">R ${f.read}</span>` : ''}
+                      ${f.written > 0 ? `<span class="pill pill-accent mono">W ${f.written}</span>` : ''}
+                      ${f.searched > 0 ? `<span class="pill mono">S ${f.searched}</span>` : ''}
+                      ${f.images > 0 ? `<span class="pill pill-warn mono">IMG ${f.images}</span>` : ''}
+                      ${(f.addedLines || f.removedLines) ? `<span class="pill mono"><span style="color:var(--good)">+${f.addedLines}</span> <span style="color:var(--danger)">-${f.removedLines}</span></span>` : ''}
+                    </div>
+                  </div>
+                  ${isOpen ? buildOpsHtml(f) : ''}
+                </div>
+              `;
+            }).join('')}
+          </div>
+          ${remaining > 0 ? `
+            <div class="list-more-wrap">
+              <button class="btn btn-sm" type="button" data-load-more>${escHtml(t('showMoreItems').replace('{count}', String(remaining)))}</button>
+            </div>
+          ` : ''}`
+      }
+    `;
+
+    const bindBody = (bodyEl) => {
+      if (!bodyEl) return;
+      bodyEl.addEventListener('input', (e) => {
+        if (e.target && e.target.id === 'fa-search') {
+          callbacks?.onSearch?.(e.target.value);
+        }
+      });
+      bodyEl.addEventListener('change', (e) => {
+        if (e.target && e.target.id === 'fa-sort') {
+          callbacks?.onSort?.(e.target.value);
+        }
+      });
+      bodyEl.addEventListener('click', (e) => {
+        const moreBtn = e.target?.closest?.('[data-load-more]');
+        if (moreBtn) {
+          callbacks?.onLoadMore?.();
+          return;
+        }
+        const jumpBtn = e.target?.closest?.('[data-jump-file-step]');
+        if (jumpBtn) {
+          e.stopPropagation();
+          const [seqStr, stepStr] = (jumpBtn.getAttribute('data-jump-file-step') || '0:0').split(':');
           callbacks?.onJumpToBrowserStep?.(Number(seqStr), Number(stepStr));
-        });
+          return;
+        }
+        const toggleEl = e.target?.closest?.('[data-toggle-file]');
+        if (toggleEl) {
+          const fp = toggleEl.getAttribute('data-toggle-file');
+          const rowItem = toggleEl.closest('.row-item');
+          const chev = toggleEl.querySelector('[data-file-chev]');
+          const willOpen = !expanded.has(fp);
+          callbacks?.onToggleFile?.(fp, { silent: true });
+          if (chev) chev.textContent = willOpen ? '▾' : '▸';
+          if (!rowItem) return;
+          const existing = rowItem.querySelector('.file-ops-wrap');
+          if (!willOpen) {
+            if (existing) existing.remove();
+            return;
+          }
+          const fileObj = fileByPath.get(fp);
+          if (!fileObj) return;
+          if (!existing) {
+            rowItem.insertAdjacentHTML('beforeend', buildOpsHtml(fileObj));
+          }
+        }
       });
     };
 
@@ -87,42 +174,7 @@
         </div>
 
         <div class="fa-body"${isCollapsed ? ' hidden' : ''} style="display:flex;flex-direction:column;gap:8px">
-          <div class="filter-bar">
-            <input class="input" id="fa-search" type="search" style="flex:1;min-width:160px" placeholder="${escHtml(t('searchFiles'))}" value="${escHtml(state.search || '')}"/>
-            <select class="select" id="fa-sort" style="font-size:11px">
-              <option value="ops" ${sortBy === 'ops' ? 'selected' : ''}>Ops</option>
-              <option value="changes" ${sortBy === 'changes' ? 'selected' : ''}>+/- Lines</option>
-              <option value="name" ${sortBy === 'name' ? 'selected' : ''}>Name</option>
-            </select>
-          </div>
-
-          ${list.length === 0
-            ? `<div class="empty-state">${escHtml(t('noFiles'))}</div>`
-            : `<div class="list-scroll">
-                ${list.map(f => {
-                  const isOpen = expanded.has(f.path);
-                  return `
-                    <div class="row-item">
-                      <div class="row-head" style="cursor:pointer" data-toggle-file="${escHtml(f.path)}">
-                        <div style="display:flex;align-items:center;gap:7px;min-width:0;flex:1">
-                          <span data-file-chev style="color:var(--ink-muted);font-size:10px">${isOpen ? '▾' : '▸'}</span>
-                          <span style="font-weight:600;font-size:12px" title="${escHtml(f.path)}">${escHtml(f.name)}</span>
-                          <span class="card-subtitle mono" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(f.path)}</span>
-                        </div>
-                        <div class="filter-bar">
-                          ${f.read > 0 ? `<span class="pill mono">R ${f.read}</span>` : ''}
-                          ${f.written > 0 ? `<span class="pill pill-accent mono">W ${f.written}</span>` : ''}
-                          ${f.searched > 0 ? `<span class="pill mono">S ${f.searched}</span>` : ''}
-                          ${f.images > 0 ? `<span class="pill pill-warn mono">IMG ${f.images}</span>` : ''}
-                          ${(f.addedLines || f.removedLines) ? `<span class="pill mono"><span style="color:var(--good)">+${f.addedLines}</span> <span style="color:var(--danger)">-${f.removedLines}</span></span>` : ''}
-                        </div>
-                      </div>
-                      ${isOpen ? buildOpsHtml(f) : ''}
-                    </div>
-                  `;
-                }).join('')}
-              </div>`
-          }
+          ${bodyBuilt ? buildBodyHtml() : ''}
         </div>
       </div>
     `;
@@ -134,6 +186,11 @@
       const chevEl = container.querySelector('#fa-toggle .calls-chevron');
       const foldBtn = container.querySelector('#fa-toggle');
       const actionBtn = container.querySelector('#fa-fold-action');
+      if (!isCollapsed && !bodyBuilt && bodyEl) {
+        bodyBuilt = true;
+        bodyEl.innerHTML = buildBodyHtml();
+        bindBody(bodyEl);
+      }
       if (bodyEl) bodyEl.hidden = isCollapsed;
       if (filtersEl) filtersEl.hidden = isCollapsed;
       if (chevEl) chevEl.textContent = isCollapsed ? '▸' : '▾';
@@ -147,36 +204,10 @@
     container.querySelectorAll('[data-fkind]').forEach(btn => {
       btn.addEventListener('click', () => callbacks?.onChangeKind?.(btn.getAttribute('data-fkind')));
     });
-    const searchEl = container.querySelector('#fa-search');
-    if (searchEl) searchEl.addEventListener('input', () => callbacks?.onSearch?.(searchEl.value));
-    const sortEl = container.querySelector('#fa-sort');
-    if (sortEl) sortEl.addEventListener('change', () => callbacks?.onSort?.(sortEl.value));
 
-    container.querySelectorAll('[data-toggle-file]').forEach(el => {
-      el.addEventListener('click', () => {
-        const fp = el.getAttribute('data-toggle-file');
-        const rowItem = el.closest('.row-item');
-        const chev = el.querySelector('[data-file-chev]');
-        const willOpen = !expanded.has(fp);
-        callbacks?.onToggleFile?.(fp, { silent: true });
-        if (chev) chev.textContent = willOpen ? '▾' : '▸';
-        if (!rowItem) return;
-        const existing = rowItem.querySelector('.file-ops-wrap');
-        if (!willOpen) {
-          if (existing) existing.remove();
-          return;
-        }
-        const fileObj = fileByPath.get(fp);
-        if (!fileObj) return;
-        if (!existing) {
-          rowItem.insertAdjacentHTML('beforeend', buildOpsHtml(fileObj));
-          const added = rowItem.querySelector('.file-ops-wrap');
-          if (added) bindOpsJumpButtons(added);
-        }
-      });
-    });
-
-    bindOpsJumpButtons(container);
+    if (bodyBuilt) {
+      bindBody(container.querySelector('.fa-body'));
+    }
   }
 
   AGY.views = AGY.views || {};

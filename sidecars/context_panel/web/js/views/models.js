@@ -25,11 +25,12 @@
     }
 
     let isCollapsed = Boolean(state?.collapsed);
+    let bodyBuilt = !isCollapsed;
     const branchIcon = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><circle cx="12" cy="18" r="3"/><path d="M8.5 7.5 11 15.5"/><path d="M15.5 7.5 13 15.5"/></svg>`;
 
     let titleHtml = '';
     let metaPillsHtml = '';
-    let bodyInnerHtml = '';
+    let buildBodyHtml = () => '';
 
     const renderCompactionRow = (comp, prefixLabel) => {
       if (!comp || !(comp.calls > 0)) return '';
@@ -57,14 +58,6 @@
       const exec = split.executor || {};
       const direct = split.direct?.calls > 0 ? split.direct : null;
       const comp = split.compaction?.calls > 0 ? split.compaction : compaction;
-      const barEntries = [
-        { cls: 'orch-split-bar-orch', cost: orch.cost || 0, tok: orch.totalTokens || 0 },
-        { cls: 'orch-split-bar-exec', cost: exec.cost || 0, tok: exec.totalTokens || 0 },
-        ...(direct ? [{ cls: 'orch-split-bar-direct', cost: direct.cost || 0, tok: direct.totalTokens || 0 }] : []),
-        ...(comp ? [{ cls: 'orch-split-bar-compaction', cost: comp.cost || 0, tok: comp.totalTokens || 0 }] : []),
-      ];
-      const useCostWeight = barEntries.some(e => e.cost > 0);
-      const totalWeight = barEntries.reduce((acc, e) => acc + (useCostWeight ? e.cost : e.tok), 0);
 
       const pills = [];
       if (split.isSameModelOrchestrated) {
@@ -78,98 +71,112 @@
       }
       pills.push(`<span class="orch-split-meta-pill is-total">${escHtml(fmtCost(split.totalCost))}</span>`);
 
-      const renderRoleRow = (roleKey, badgeText, metrics) => {
-        const labels = isZh ? metrics.labelsZh : metrics.labelsEn;
-        const primary = isZh ? metrics.primaryLabelZh : metrics.primaryLabelEn;
-        const modelLabel = Array.isArray(labels) && labels.length > 1
-          ? labels.join(' / ')
-          : (primary || '—');
-        return `
-          <div class="orch-split-row">
-            <div class="orch-split-row-main">
-              <span class="orch-role-badge is-${roleKey}">${escHtml(badgeText)}</span>
-              <span class="orch-split-model" title="${escHtml(modelLabel)}">${escHtml(modelLabel)}</span>
-            </div>
-            <div class="orch-split-row-metrics">
-              <span class="orch-split-metric">${Number(metrics.calls) || 0} ${escHtml(t('modelCallsUnit'))}</span>
-              <span class="orch-split-metric">${escHtml(fmtTokens(metrics.totalTokens || 0))} tok</span>
-              <span class="orch-split-metric">${escHtml(t('modelCacheShort'))} ${escHtml(fmtCacheRatePct(metrics.cacheHitRate))}</span>
-              <span class="orch-split-metric is-cost">${escHtml(fmtCost(metrics.cost || 0))}</span>
-            </div>
-          </div>
-        `;
-      };
-
-      const coldBannerHtml = split.coldCacheSwitchCount > 0
-        ? `
-          <div class="orch-cold-note">
-            <span class="orch-cold-switch-pill">${escHtml(t('callsSwitchCold'))} ×${split.coldCacheSwitchCount}</span>
-            <span>${escHtml(t('orchColdSwitchDesc').replace('{tokens}', fmtTokens(split.coldCacheSwitchInputTokens || 0)))}</span>
-          </div>
-        `
-        : '';
-
       titleHtml = `${branchIcon}<span class="card-title">${escHtml(t('orchVsExecTitle'))}</span>`;
       metaPillsHtml = pills.join('');
-      bodyInnerHtml = `
-        <div class="orch-split-bar" aria-hidden="true">
-          ${barEntries.map((e) => {
-            const w = totalWeight > 0 ? ((useCostWeight ? e.cost : e.tok) / totalWeight) * 100 : 0;
-            return w > 0 ? `<span class="${e.cls}" style="width:${Math.max(1.5, w).toFixed(2)}%"></span>` : '';
-          }).join('')}
-        </div>
-        <div class="orch-split-rows">
-          ${renderRoleRow('orchestrator', t('orchRolePlanner'), orch)}
-          ${renderRoleRow('executor', t('orchRoleExecutor'), exec)}
-          ${direct ? renderRoleRow('direct', t('orchRoleDirect'), direct) : ''}
-          ${comp ? renderCompactionRow(comp, t('orchRoleCompaction')) : ''}
-        </div>
-        ${coldBannerHtml}
-      `;
+      buildBodyHtml = () => {
+        const barEntries = [
+          { cls: 'orch-split-bar-orch', cost: orch.cost || 0, tok: orch.totalTokens || 0 },
+          { cls: 'orch-split-bar-exec', cost: exec.cost || 0, tok: exec.totalTokens || 0 },
+          ...(direct ? [{ cls: 'orch-split-bar-direct', cost: direct.cost || 0, tok: direct.totalTokens || 0 }] : []),
+          ...(comp ? [{ cls: 'orch-split-bar-compaction', cost: comp.cost || 0, tok: comp.totalTokens || 0 }] : []),
+        ];
+        const useCostWeight = barEntries.some(e => e.cost > 0);
+        const totalWeight = barEntries.reduce((acc, e) => acc + (useCostWeight ? e.cost : e.tok), 0);
+
+        const renderRoleRow = (roleKey, badgeText, metrics) => {
+          const labels = isZh ? metrics.labelsZh : metrics.labelsEn;
+          const primary = isZh ? metrics.primaryLabelZh : metrics.primaryLabelEn;
+          const modelLabel = Array.isArray(labels) && labels.length > 1
+            ? labels.join(' / ')
+            : (primary || '—');
+          return `
+            <div class="orch-split-row">
+              <div class="orch-split-row-main">
+                <span class="orch-role-badge is-${roleKey}">${escHtml(badgeText)}</span>
+                <span class="orch-split-model" title="${escHtml(modelLabel)}">${escHtml(modelLabel)}</span>
+              </div>
+              <div class="orch-split-row-metrics">
+                <span class="orch-split-metric">${Number(metrics.calls) || 0} ${escHtml(t('modelCallsUnit'))}</span>
+                <span class="orch-split-metric">${escHtml(fmtTokens(metrics.totalTokens || 0))} tok</span>
+                <span class="orch-split-metric">${escHtml(t('modelCacheShort'))} ${escHtml(fmtCacheRatePct(metrics.cacheHitRate))}</span>
+                <span class="orch-split-metric is-cost">${escHtml(fmtCost(metrics.cost || 0))}</span>
+              </div>
+            </div>
+          `;
+        };
+
+        const coldBannerHtml = split.coldCacheSwitchCount > 0
+          ? `
+            <div class="orch-cold-note">
+              <span class="orch-cold-switch-pill">${escHtml(t('callsSwitchCold'))} ×${split.coldCacheSwitchCount}</span>
+              <span>${escHtml(t('orchColdSwitchDesc').replace('{tokens}', fmtTokens(split.coldCacheSwitchInputTokens || 0)))}</span>
+            </div>
+          `
+          : '';
+
+        return `
+          <div class="orch-split-bar" aria-hidden="true">
+            ${barEntries.map((e) => {
+              const w = totalWeight > 0 ? ((useCostWeight ? e.cost : e.tok) / totalWeight) * 100 : 0;
+              return w > 0 ? `<span class="${e.cls}" style="width:${Math.max(1.5, w).toFixed(2)}%"></span>` : '';
+            }).join('')}
+          </div>
+          <div class="orch-split-rows">
+            ${renderRoleRow('orchestrator', t('orchRolePlanner'), orch)}
+            ${renderRoleRow('executor', t('orchRoleExecutor'), exec)}
+            ${direct ? renderRoleRow('direct', t('orchRoleDirect'), direct) : ''}
+            ${comp ? renderCompactionRow(comp, t('orchRoleCompaction')) : ''}
+          </div>
+          ${coldBannerHtml}
+        `;
+      };
     } else {
       const byModelCost = byModel.reduce((acc, row) => acc + (Number(row.cost) || 0), 0) + (compaction?.cost || 0);
       const totalCost = Number.isFinite(modelUsage?.totalCost) ? modelUsage.totalCost : byModelCost;
-      const barItems = [
-        ...byModel.map(r => ({ cost: Number(r.cost) || 0, tok: Number(r.totalTokens) || 0, isCompaction: false })),
-        ...(compaction?.calls > 0 ? [{ cost: Number(compaction.cost) || 0, tok: Number(compaction.totalTokens) || 0, isCompaction: true }] : []),
-      ];
-      const totalWeight = barItems.reduce((acc, r) => acc + (totalCost > 0 ? r.cost : r.tok), 0);
-      const barColors = ['var(--accent)', 'var(--good)', 'var(--cat-tool-def)', 'var(--cat-injected)', 'var(--cat-skills)'];
-
-      const barHtml = barItems.length > 1 && totalWeight > 0
-        ? `<div class="orch-split-bar" aria-hidden="true">${barItems.map((item, idx) => {
-            const w = ((totalCost > 0 ? item.cost : item.tok) / totalWeight) * 100;
-            const bg = item.isCompaction ? 'var(--warn)' : barColors[idx % barColors.length];
-            return w > 0 ? `<span style="width:${Math.max(1.5, w).toFixed(2)}%;background:${bg};height:100%"></span>` : '';
-          }).join('')}</div>`
-        : '';
 
       titleHtml = `<span class="card-title">◈ ${escHtml(t('modelUsageTitle'))}</span><span class="pill mono">${byModel.length}</span>`;
       metaPillsHtml = `<span class="orch-split-meta-pill is-total">${escHtml(fmtCost(totalCost))}</span>`;
-      bodyInnerHtml = `
-        ${barHtml}
-        <div class="orch-split-rows">
-          ${byModel.map((row) => {
-            const name = (isZh ? row.labelZh : row.labelEn) || row.model || '—';
-            const poolText = poolLabel(row.quotaPool, t);
-            return `
-              <div class="orch-split-row">
-                <div class="orch-split-row-main">
-                  ${poolText ? `<span class="orch-pool-tag">${escHtml(poolText)}</span>` : ''}
-                  <span class="orch-split-model" title="${escHtml(`${name} (${row.model})`) }">${escHtml(name)}</span>
+      buildBodyHtml = () => {
+        const barItems = [
+          ...byModel.map(r => ({ cost: Number(r.cost) || 0, tok: Number(r.totalTokens) || 0, isCompaction: false })),
+          ...(compaction?.calls > 0 ? [{ cost: Number(compaction.cost) || 0, tok: Number(compaction.totalTokens) || 0, isCompaction: true }] : []),
+        ];
+        const totalWeight = barItems.reduce((acc, r) => acc + (totalCost > 0 ? r.cost : r.tok), 0);
+        const barColors = ['var(--accent)', 'var(--good)', 'var(--cat-tool-def)', 'var(--cat-injected)', 'var(--cat-skills)'];
+
+        const barHtml = barItems.length > 1 && totalWeight > 0
+          ? `<div class="orch-split-bar" aria-hidden="true">${barItems.map((item, idx) => {
+              const w = ((totalCost > 0 ? item.cost : item.tok) / totalWeight) * 100;
+              const bg = item.isCompaction ? 'var(--warn)' : barColors[idx % barColors.length];
+              return w > 0 ? `<span style="width:${Math.max(1.5, w).toFixed(2)}%;background:${bg};height:100%"></span>` : '';
+            }).join('')}</div>`
+          : '';
+
+        return `
+          ${barHtml}
+          <div class="orch-split-rows">
+            ${byModel.map((row) => {
+              const name = (isZh ? row.labelZh : row.labelEn) || row.model || '—';
+              const poolText = poolLabel(row.quotaPool, t);
+              return `
+                <div class="orch-split-row">
+                  <div class="orch-split-row-main">
+                    ${poolText ? `<span class="orch-pool-tag">${escHtml(poolText)}</span>` : ''}
+                    <span class="orch-split-model" title="${escHtml(`${name} (${row.model})`) }">${escHtml(name)}</span>
+                  </div>
+                  <div class="orch-split-row-metrics">
+                    <span class="orch-split-metric">${Number(row.calls) || 0} ${escHtml(t('modelCallsUnit'))}</span>
+                    <span class="orch-split-metric">${escHtml(fmtTokens(row.totalTokens || 0))} tok</span>
+                    <span class="orch-split-metric">${escHtml(t('modelCacheShort'))} ${escHtml(fmtCacheRatePct(row.cacheHitRate))}</span>
+                    <span class="orch-split-metric is-cost">${escHtml(fmtCost(row.cost || 0))}</span>
+                  </div>
                 </div>
-                <div class="orch-split-row-metrics">
-                  <span class="orch-split-metric">${Number(row.calls) || 0} ${escHtml(t('modelCallsUnit'))}</span>
-                  <span class="orch-split-metric">${escHtml(fmtTokens(row.totalTokens || 0))} tok</span>
-                  <span class="orch-split-metric">${escHtml(t('modelCacheShort'))} ${escHtml(fmtCacheRatePct(row.cacheHitRate))}</span>
-                  <span class="orch-split-metric is-cost">${escHtml(fmtCost(row.cost || 0))}</span>
-                </div>
-              </div>
-            `;
-          }).join('')}
-          ${compaction?.calls > 0 ? renderCompactionRow(compaction, t('orchRoleCompaction')) : ''}
-        </div>
-      `;
+              `;
+            }).join('')}
+            ${compaction?.calls > 0 ? renderCompactionRow(compaction, t('orchRoleCompaction')) : ''}
+          </div>
+        `;
+      };
     }
 
     container.innerHTML = `
@@ -187,7 +194,7 @@
           </div>
         </div>
         <div class="models-body"${isCollapsed ? ' hidden' : ''}>
-          ${bodyInnerHtml}
+          ${bodyBuilt ? buildBodyHtml() : ''}
         </div>
       </div>
     `;
@@ -198,6 +205,10 @@
       const chevEl = container.querySelector('#models-toggle .calls-chevron');
       const foldBtn = container.querySelector('#models-toggle');
       const actionBtn = container.querySelector('#models-fold-action');
+      if (!isCollapsed && !bodyBuilt && bodyEl) {
+        bodyBuilt = true;
+        bodyEl.innerHTML = buildBodyHtml();
+      }
       if (bodyEl) bodyEl.hidden = isCollapsed;
       if (chevEl) chevEl.textContent = isCollapsed ? '▸' : '▾';
       if (foldBtn) foldBtn.setAttribute('aria-expanded', String(!isCollapsed));

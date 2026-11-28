@@ -1749,13 +1749,17 @@ function summarizeCommands(allCommands) {
       failedCount: failed,
     },
     programs,
-    items: allCommands,
+    items: allCommands.map(cmd => ({
+      ...cmd,
+      commandLine: cmd.commandLine && cmd.commandLine.length > 600 ? cmd.commandLine.slice(0, 599) + '…' : (cmd.commandLine || ''),
+    })),
   };
 }
 
 export class SessionDetailStore {
   constructor() {
     this.lru = new Map(); // convId -> analyzed session
+    this.inFlight = new Map(); // convId -> Promise
   }
 
   async load(convId, meta, options = {}) {
@@ -1778,24 +1782,39 @@ export class SessionDetailStore {
       return cached;
     }
 
-    const parsed = parseTranscriptFile(filePath, { keepFullText: true });
-    if (!parsed) return null;
-    parsed.isFull = isFull;
-
-    const officialRaw = await getGeneratorMetadata(convId, { force });
-    const transcriptModel = [...parsed.steps].reverse()
-      .find(step => step.type === 'PLANNER_RESPONSE' && step.model)?.model || '';
-    const official = parseOfficialContext(officialRaw, { modelId: transcriptModel });
-    const analyzed = analyzeSession(convId, parsed, meta, official);
-    this.lru.set(convId, analyzed);
-
-    // Evict oldest entry beyond LRU cap
-    while (this.lru.size > MAX_LRU_SESSIONS) {
-      const oldestKey = this.lru.keys().next().value;
-      this.lru.delete(oldestKey);
+    if (!force && this.inFlight.has(convId)) {
+      return this.inFlight.get(convId);
     }
 
-    return analyzed;
+    const promise = (async () => {
+      try {
+        const parsed = parseTranscriptFile(filePath, { keepFullText: true });
+        if (!parsed) return null;
+        parsed.isFull = isFull;
+
+        const officialRaw = await getGeneratorMetadata(convId, { force });
+        const transcriptModel = [...parsed.steps].reverse()
+          .find(step => step.type === 'PLANNER_RESPONSE' && step.model)?.model || '';
+        const official = parseOfficialContext(officialRaw, { modelId: transcriptModel });
+        const analyzed = analyzeSession(convId, parsed, meta, official);
+        this.lru.set(convId, analyzed);
+
+        // Evict oldest entry beyond LRU cap
+        while (this.lru.size > MAX_LRU_SESSIONS) {
+          const oldestKey = this.lru.keys().next().value;
+          this.lru.delete(oldestKey);
+        }
+
+        return analyzed;
+      } finally {
+        if (this.inFlight.get(convId) === promise) {
+          this.inFlight.delete(convId);
+        }
+      }
+    })();
+
+    this.inFlight.set(convId, promise);
+    return promise;
   }
 
   async getOverview(convId, meta, selectedSeq = -1, options = {}) {
@@ -1848,7 +1867,7 @@ export class SessionDetailStore {
           composition: s.composition,
           delta: s.delta,
           flags: s.flags,
-          brief: s.brief,
+          brief: (s.seq === activeSeq || s.seq === steps.length - 1) ? s.brief : null,
         })),
         turns: session.timeline.turns,
       },

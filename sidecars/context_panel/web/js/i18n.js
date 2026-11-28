@@ -319,6 +319,7 @@
       pricingHint: '基于参考单价估算（USD / 1M tokens）',
       copy: '复制',
       copied: '已复制',
+      showMoreItems: '显示更多（剩余 {count} 条）',
     },
     en: {
       brand: 'Antigravity Context',
@@ -623,6 +624,7 @@
       pricingHint: 'Estimated from reference rates (USD / 1M tokens)',
       copy: 'Copy',
       copied: 'Copied',
+      showMoreItems: 'Show more ({count} remaining)',
     },
   };
 

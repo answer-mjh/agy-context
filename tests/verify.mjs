@@ -1,4 +1,10 @@
 import assert from 'node:assert/strict';
+import { createServer as createHttpServer } from 'node:http';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { clearLsCache, getGeneratorMetadata } from '../sidecars/context_panel/lib/ls-rpc.mjs';
+import { ProjectionStore } from '../sidecars/context_panel/lib/projection.mjs';
 import { createRouter, startStandaloneServer } from '../sidecars/context_panel/lib/router.mjs';
 import {
   classifyCacheStart,
@@ -6,7 +12,7 @@ import {
   parseDurationMs,
   parseOfficialContext,
 } from '../sidecars/context_panel/lib/official-context.mjs';
-import { analyzeSession } from '../sidecars/context_panel/lib/session-detail.mjs';
+import { analyzeSession, SessionDetailStore } from '../sidecars/context_panel/lib/session-detail.mjs';
 import {
   WEEKLY_WINDOW_MS,
   inferModelQuotaPool,
@@ -432,6 +438,44 @@ async function run() {
   assert.equal(singleDirect.modelUsage.byModel[0].labelZh, 'Gemini 4 Neon (高)');
   console.log('[verify] Per-call telemetry diagnostics, pricing & modelUsage OK');
 
+  // 0f. Slim overview payload unit checks (commandLine truncation <= 600, inactive steps brief === null)
+  const tmpBrain = mkdtempSync(join(tmpdir(), 'agy-verify-slim-'));
+  const prevBrainEnv = process.env.AGY_CONTEXT_BRAIN_DIR;
+  try {
+    const convId = 'slim-payload-test';
+    const logsDir = join(tmpBrain, convId, '.system_generated', 'logs');
+    mkdirSync(logsDir, { recursive: true });
+    const longCmd = 'echo ' + 'x'.repeat(900);
+    const synthSteps = [
+      { stepIndex: 1, type: 'USER_INPUT', created_at: '2026-11-28T00:00:00Z', content: 'step 1' },
+      { stepIndex: 2, type: 'PLANNER_RESPONSE', created_at: '2026-11-28T00:00:02Z', model: 'gemini-4-neon-high', input_tokens: 100, cache_read_tokens: 0, output_tokens: 50, content: 'r1' },
+      { stepIndex: 3, type: 'PLANNER_RESPONSE', created_at: '2026-11-28T00:00:04Z', model: 'gemini-4-neon-high', input_tokens: 120, cache_read_tokens: 0, output_tokens: 60, content: 'r2', tool_calls: [{ name: 'run_command', args: { CommandLine: longCmd } }] },
+      { stepIndex: 4, type: 'GENERIC', created_at: '2026-11-28T00:00:05Z', content: 'ok', duration_ms: 120, exit_code: 0 },
+      { stepIndex: 5, type: 'PLANNER_RESPONSE', created_at: '2026-11-28T00:00:07Z', model: 'gemini-4-neon-high', input_tokens: 140, cache_read_tokens: 0, output_tokens: 70, content: 'r3' },
+    ];
+    writeFileSync(join(logsDir, 'transcript.jsonl'), synthSteps.map(s => JSON.stringify(s)).join('\n'), 'utf8');
+    process.env.AGY_CONTEXT_BRAIN_DIR = tmpBrain;
+    const slimStore = new SessionDetailStore();
+    const overviewLatest = await slimStore.getOverview(convId, { title: 'slim-test' }, -1);
+    assert.ok(overviewLatest && overviewLatest.timeline.steps.length === 3);
+    assert.equal(overviewLatest.timeline.steps[0].brief, null, 'inactive step 0 brief must be null');
+    assert.equal(overviewLatest.timeline.steps[1].brief, null, 'inactive step 1 brief must be null');
+    assert.ok(overviewLatest.timeline.steps[2].brief !== null, 'latest step brief must be preserved');
+    assert.equal(overviewLatest.commands.items.length, 1);
+    assert.equal(overviewLatest.commands.items[0].commandLine.length, 600);
+    assert.ok(overviewLatest.commands.items[0].commandLine.endsWith('…'));
+
+    const overviewPinned0 = await slimStore.getOverview(convId, { title: 'slim-test' }, 0);
+    assert.ok(overviewPinned0.timeline.steps[0].brief !== null, 'pinned step 0 brief must be preserved');
+    assert.equal(overviewPinned0.timeline.steps[1].brief, null, 'inactive step 1 brief must be null when step 0 pinned');
+    assert.ok(overviewPinned0.timeline.steps[2].brief !== null, 'latest step brief must be preserved');
+    console.log('[verify] Slim overview payload unit checks OK');
+  } finally {
+    if (prevBrainEnv === undefined) delete process.env.AGY_CONTEXT_BRAIN_DIR;
+    else process.env.AGY_CONTEXT_BRAIN_DIR = prevBrainEnv;
+    rmSync(tmpBrain, { recursive: true, force: true });
+  }
+
   const router = createRouter({ version: '0.1.0-test' });
   const server = await startStandaloneServer(router, { port: 0, host: '127.0.0.1' });
 
@@ -637,7 +681,46 @@ async function run() {
         `[verify] Fleet OK: agents=${fleet.agents.length}, children=${fleet.summary.children}, ` +
         `tasks=${fleet.tasks.length}, timeline=${fleet.timeline.length}, messages=${fleet.summary.messages}`
       );
+
+      // Parallel /api/session?omitSessions=1 + /api/step and slim payload checks
+      const [parSessRes, parStepRes] = await Promise.all([
+        fetch(`${server.url}/api/session?id=${encodeURIComponent(health.latestSessionId)}&omitSessions=1`),
+        fetch(`${server.url}/api/step?id=${encodeURIComponent(health.latestSessionId)}`),
+      ]);
+      assert.equal(parSessRes.status, 200);
+      assert.equal(parStepRes.status, 200);
+      const [parSess, parStep] = await Promise.all([parSessRes.json(), parStepRes.json()]);
+      assert.equal(parSess.empty, false);
+      assert.ok(Array.isArray(parSess.sessions) && parSess.sessions.length === 0, 'omitSessions=1 must return empty sessions[]');
+      assert.ok(parSess.session && parSess.session.id === health.latestSessionId);
+      assert.ok(parStep && parStep.id === health.latestSessionId);
+      for (const cmd of parSess.session.commands?.items || []) {
+        assert.ok(typeof cmd.commandLine === 'string' && cmd.commandLine.length <= 600, `commandLine exceeded 600 chars: ${cmd.commandLine?.length}`);
+      }
+      const parSteps = parSess.session.timeline?.steps || [];
+      if (parSteps.length > 2) {
+        const activeIdx = parSess.session.selectedSeq;
+        for (let i = 0; i < parSteps.length; i++) {
+          if (i !== activeIdx && i !== parSteps.length - 1) {
+            assert.equal(parSteps[i].brief, null, `inactive step ${i} brief should be null`);
+          }
+        }
+      }
+      console.log('[verify] Parallel session+step, omitSessions=1 & slim payload OK');
     }
+
+    // 4b. Rendered HTML embeds window.__AGY_INIT_PREFS__=
+    for (const htmlPath of ['/', '/aux', '/full']) {
+      const htmlRes = await fetch(`${server.url}${htmlPath}`);
+      assert.equal(htmlRes.status, 200);
+      const htmlText = await htmlRes.text();
+      assert.ok(htmlText.includes('window.__AGY_INIT_PREFS__='), `${htmlPath} missing window.__AGY_INIT_PREFS__=`);
+      const m = htmlText.match(/window\.__AGY_INIT_PREFS__=(\{[\s\S]*?\});/);
+      assert.ok(m, `${htmlPath} __AGY_INIT_PREFS__ assignment not parseable`);
+      const parsedPrefs = JSON.parse(m[1]);
+      assert.ok(parsedPrefs && typeof parsedPrefs.lang === 'string');
+    }
+    console.log('[verify] Rendered HTML window.__AGY_INIT_PREFS__ injection OK');
 
     // 5. Prefs GET/POST (including weekly_quota roundtrip without mutating saved pref)
     const prefsGet = await fetch(`${server.url}/api/prefs`);
@@ -658,6 +741,62 @@ async function run() {
     });
     assert.equal(prefsRestore.status, 200);
     console.log('[verify] Prefs GET/POST OK');
+
+    // 6. ls-rpc inFlightMetadata deduplication & ProjectionStore refresh deduplication
+    let rpcHits = 0;
+    const mockLs = createHttpServer((req, res) => {
+      rpcHits++;
+      setTimeout(() => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ generatorMetadata: [{ stepIndices: [1], chatModel: { model: 'gemini-4-neon-high' } }] }));
+      }, 40);
+    });
+    await new Promise((resolve) => mockLs.listen(0, '127.0.0.1', resolve));
+    const prevLsAddr = process.env.ANTIGRAVITY_LS_ADDRESS;
+    const prevLsToken = process.env.ANTIGRAVITY_CSRF_TOKEN;
+    try {
+      const addr = mockLs.address();
+      process.env.ANTIGRAVITY_LS_ADDRESS = `http://127.0.0.1:${addr.port}`;
+      process.env.ANTIGRAVITY_CSRF_TOKEN = 'test-csrf-token';
+      clearLsCache();
+
+      const [m1, m2] = await Promise.all([
+        getGeneratorMetadata('dedup-conv-1'),
+        getGeneratorMetadata('dedup-conv-1'),
+      ]);
+      assert.equal(rpcHits, 1, `concurrent getGeneratorMetadata must coalesce into 1 RPC, got ${rpcHits}`);
+      assert.equal(m1.length, 1);
+      assert.equal(m2.length, 1);
+
+      const mForce = await getGeneratorMetadata('dedup-conv-1', { force: true });
+      assert.equal(rpcHits, 2, 'force=true must bypass cache/inFlight');
+      assert.equal(mForce.length, 1);
+      clearLsCache();
+    } finally {
+      if (prevLsAddr === undefined) delete process.env.ANTIGRAVITY_LS_ADDRESS;
+      else process.env.ANTIGRAVITY_LS_ADDRESS = prevLsAddr;
+      if (prevLsToken === undefined) delete process.env.ANTIGRAVITY_CSRF_TOKEN;
+      else process.env.ANTIGRAVITY_CSRF_TOKEN = prevLsToken;
+      await new Promise((resolve) => mockLs.close(resolve));
+    }
+
+    const projStore = new ProjectionStore();
+    let doRefreshCalls = 0;
+    projStore._doRefresh = async () => {
+      doRefreshCalls++;
+      await new Promise(r => setTimeout(r, 30));
+      projStore.lastScanMs = Date.now();
+      return projStore.cache.conversations;
+    };
+    await Promise.all([projStore.refresh(false), projStore.refresh(false)]);
+    assert.equal(doRefreshCalls, 1, 'concurrent refresh(false) must deduplicate');
+    projStore.loaded = true;
+    projStore.cache.conversations = { a: { id: 'a', lastMs: 10 }, b: { id: 'b', lastMs: 20 } };
+    projStore.lastScanMs = Date.now() - 5000;
+    const fastList = await projStore.listSessionsFast();
+    assert.deepEqual(fastList.map(x => x.id), ['b', 'a']);
+    await new Promise(r => setTimeout(r, 50));
+    console.log('[verify] ls-rpc inFlight & ProjectionStore dedup/listSessionsFast OK');
 
     console.log('[verify] ALL BACKEND CHECKS PASSED');
   } finally {

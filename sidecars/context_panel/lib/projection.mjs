@@ -557,6 +557,7 @@ export class ProjectionStore {
     this.cache = { version: CACHE_VERSION, conversations: {} };
     this.loaded = false;
     this.lastScanMs = 0;
+    this.refreshPromise = null;
   }
 
   loadDiskCache() {
@@ -590,6 +591,21 @@ export class ProjectionStore {
   }
 
   async refresh(force = false) {
+    if (!force && this.refreshPromise) {
+      return this.refreshPromise;
+    }
+    const run = this._doRefresh(force);
+    this.refreshPromise = run;
+    try {
+      return await run;
+    } finally {
+      if (this.refreshPromise === run) {
+        this.refreshPromise = null;
+      }
+    }
+  }
+
+  async _doRefresh(force = false) {
     this.loadDiskCache();
     const now = Date.now();
     // Throttle filesystem scans to at most once every 1.2s unless forced
@@ -667,6 +683,17 @@ export class ProjectionStore {
   async listSessions() {
     const convs = await this.refresh();
     return Object.values(convs).sort((a, b) => (b.lastMs || 0) - (a.lastMs || 0));
+  }
+
+  async listSessionsFast() {
+    this.loadDiskCache();
+    if (Object.keys(this.cache.conversations).length === 0 && this.lastScanMs === 0) {
+      return this.listSessions();
+    }
+    if (Date.now() - this.lastScanMs >= 1200 && !this.refreshPromise) {
+      void this.refresh(false).catch(() => {});
+    }
+    return Object.values(this.cache.conversations).sort((a, b) => (b.lastMs || 0) - (a.lastMs || 0));
   }
 
   async getInsights(query = {}) {

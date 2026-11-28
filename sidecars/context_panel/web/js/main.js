@@ -61,11 +61,11 @@
       rawItems: new Set(),
       catSort: {},
     },
-    events: { type: 'all', collapsed: false },
+    events: { type: 'all', collapsed: false, limit: 50 },
     models: { collapsed: false },
     calls: { collapsed: false, filter: 'all', page: 1, pageSize: 20 },
-    files: { kind: 'all', search: '', sortBy: 'ops', expanded: new Set(), collapsed: false },
-    commands: { status: 'all', search: '', program: '', collapsed: false },
+    files: { kind: 'all', search: '', sortBy: 'ops', expanded: new Set(), collapsed: false, limit: 50 },
+    commands: { status: 'all', search: '', program: '', collapsed: false, limit: 50 },
     fleet: {
       data: null,
       selectedAgent: '',
@@ -81,9 +81,15 @@
     },
   };
 
+  const MAX_SESSION_CACHE = 4;
+  const sessionCache = new Map();
+  const paneDirty = { insights: true, context: true, fleet: true };
   let hoverFetchTimer = null;
   let pollTimer = null;
   let sessionLoadToken = 0;
+  let stepLoadToken = 0;
+  let contextRenderToken = 0;
+  let contextRafId = 0;
 
   function qs(obj) {
     const p = new URLSearchParams();
@@ -145,7 +151,10 @@
         if (nextPage !== appState.page) {
           appState.page = nextPage;
           renderTopbar();
-          renderMain();
+          const pane = showActivePane();
+          if (pane && (paneDirty[nextPage] || pane.childElementCount === 0)) {
+            renderMain();
+          }
           loadActivePage(false);
         }
       });
@@ -161,18 +170,28 @@
     const sessSel = topbar.querySelector('#top-session-select');
     if (sessSel) {
       sessSel.addEventListener('change', () => {
-        appState.sessionId = sessSel.value;
+        saveCurrentSessionToCache();
+        const nextId = sessSel.value;
+        appState.sessionId = nextId;
+        appState.emptyReason = '';
         appState.timeline.pinnedSeq = -1;
         appState.timeline.hoveredSeq = -1;
         appState.calls.page = 1;
         appState.browser.openItems.clear();
-        appState.sessionData = null;
-        appState.stepData = null;
-        clearSessionCaches();
+        resetContextLimits();
+        if (!hydrateSessionFromCache(nextId)) {
+          appState.sessionData = null;
+          appState.stepData = null;
+          clearSessionCaches();
+        }
         appState.fleet.data = null;
         appState.fleet.signature = '';
         appState.fleet.selectedAgent = '';
         appState.fleet.selectedTask = '';
+        paneDirty.context = true;
+        paneDirty.fleet = true;
+        renderTopbar();
+        renderMain();
         if (appState.page === 'fleet') loadFleet(true);
         else loadContextSession();
       });
@@ -221,6 +240,9 @@
       appState.prefs = Object.assign({}, appState.prefs, patch);
     }
     applyPrefsToState(patch);
+    paneDirty.insights = true;
+    paneDirty.context = true;
+    paneDirty.fleet = true;
     if (appState.prefs.fleetTab === 'hide' && appState.page === 'fleet') {
       appState.page = 'context';
       loadActivePage();
@@ -238,12 +260,93 @@
     if (!patch || patch.browserBaseline) appState.browser.baseline = appState.prefs.browserBaseline;
   }
 
+  function resetContextLimits() {
+    appState.events.limit = 50;
+    appState.files.limit = 50;
+    appState.commands.limit = 50;
+  }
+
   function clearSessionCaches() {
     appState.sessionRev = '';
     appState.sessionQueryKey = '';
     appState.stepRev = '';
     appState.stepQueryKey = '';
     appState.stepItemCache.clear();
+  }
+
+  function saveCurrentSessionToCache() {
+    const id = (appState.sessionId || '').trim();
+    if (!id || !appState.sessionData || appState.timeline.pinnedSeq >= 0) return;
+    sessionCache.delete(id);
+    sessionCache.set(id, {
+      sessionData: appState.sessionData,
+      sessionRev: appState.sessionRev,
+      sessionQueryKey: appState.sessionQueryKey,
+      stepData: appState.stepData,
+      stepRev: appState.stepRev,
+      stepQueryKey: appState.stepQueryKey,
+    });
+    while (sessionCache.size > MAX_SESSION_CACHE) {
+      const oldestKey = sessionCache.keys().next().value;
+      sessionCache.delete(oldestKey);
+    }
+  }
+
+  function hydrateSessionFromCache(id) {
+    const clean = (id || '').trim();
+    if (!clean || !sessionCache.has(clean)) return false;
+    const cached = sessionCache.get(clean);
+    sessionCache.delete(clean);
+    sessionCache.set(clean, cached);
+    appState.sessionData = cached.sessionData || null;
+    appState.sessionRev = cached.sessionRev || '';
+    appState.sessionQueryKey = cached.sessionQueryKey || '';
+    appState.stepData = cached.stepData || null;
+    appState.stepRev = cached.stepRev || '';
+    appState.stepQueryKey = cached.stepQueryKey || '';
+    appState.stepItemCache.clear();
+    return Boolean(appState.sessionData);
+  }
+
+  function ensurePanes() {
+    const main = document.getElementById('main-content');
+    if (!main) return null;
+    let insights = document.getElementById('pane-insights');
+    let context = document.getElementById('pane-context');
+    let fleet = document.getElementById('pane-fleet');
+    if (!insights || !context || !fleet) {
+      main.innerHTML = `
+        <div id="pane-insights" class="page-pane" hidden></div>
+        <div id="pane-context" class="page-pane" hidden></div>
+        <div id="pane-fleet" class="page-pane" hidden></div>
+      `;
+      insights = document.getElementById('pane-insights');
+      context = document.getElementById('pane-context');
+      fleet = document.getElementById('pane-fleet');
+    }
+    return { insights, context, fleet };
+  }
+
+  function getActivePane() {
+    const panes = ensurePanes();
+    if (!panes) return null;
+    if (appState.page === 'insights' && !isAuxPane) return panes.insights;
+    if (appState.page === 'fleet') return panes.fleet;
+    return panes.context;
+  }
+
+  function showActivePane() {
+    const panes = ensurePanes();
+    if (!panes) return null;
+    const activeKey = appState.page === 'insights' && !isAuxPane
+      ? 'insights'
+      : appState.page === 'fleet'
+        ? 'fleet'
+        : 'context';
+    panes.insights.hidden = activeKey !== 'insights';
+    panes.context.hidden = activeKey !== 'context';
+    panes.fleet.hidden = activeKey !== 'fleet';
+    return panes[activeKey];
   }
 
   function getCachedStepItem(itemId) {
@@ -282,22 +385,29 @@
     if (!isAuxPane) return false;
     const clean = typeof nextHostId === 'string' ? nextHostId.trim() : '';
     if (!clean || clean === appState.hostSessionId) return false;
+    saveCurrentSessionToCache();
     appState.hostSessionId = clean;
     appState.sessionId = clean;
     appState.emptyReason = '';
-    appState.sessionData = null;
-    appState.stepData = null;
-    clearSessionCaches();
     appState.timeline.pinnedSeq = -1;
     appState.timeline.hoveredSeq = -1;
     appState.calls.page = 1;
     appState.browser.openItems.clear();
+    resetContextLimits();
+    if (!hydrateSessionFromCache(clean)) {
+      appState.sessionData = null;
+      appState.stepData = null;
+      clearSessionCaches();
+    }
     appState.fleet.data = null;
     appState.fleet.signature = '';
     appState.fleet.selectedAgent = '';
     appState.fleet.selectedTask = '';
+    paneDirty.context = true;
+    paneDirty.fleet = true;
     if (appState.page === 'insights') appState.page = 'context';
     renderTopbar();
+    renderMain();
     return true;
   }
 
@@ -342,6 +452,7 @@
         }));
       }
       if (appState.page === 'insights') renderMain();
+      else paneDirty.insights = true;
     } catch (err) {
       showError(err);
     }
@@ -372,29 +483,51 @@
         }
       }
       renderTopbar();
-      renderMain();
+      if (appState.page === 'context') renderMain();
+      else paneDirty.context = true;
       return;
     }
 
     try {
-      const stepParam = appState.timeline.pinnedSeq >= 0 ? appState.timeline.pinnedSeq : '';
+      const pinnedSeq = appState.timeline.pinnedSeq;
+      const stepParam = pinnedSeq >= 0 ? pinnedSeq : '';
       const queryKey = `${targetId}|${stepParam}`;
       const revParam = !force && appState.sessionData && appState.sessionQueryKey === queryKey
         ? appState.sessionRev
         : '';
-      const payload = await AGY.bridge.apiFetch(
-        `/api/session${qs({ id: targetId, step: stepParam, rev: revParam, force: force ? 1 : '' })}`
+
+      const sessionPromise = AGY.bridge.apiFetch(
+        `/api/session${qs({
+          id: targetId,
+          step: stepParam,
+          rev: revParam,
+          omitSessions: isAuxPane ? 1 : '',
+          force: force ? 1 : '',
+        })}`
       );
+      const stepPromise = loadStepBrowser(pinnedSeq, force);
+
+      const payload = await sessionPromise;
       if (myToken !== sessionLoadToken) return;
-      if (payload?.unchanged) return;
-      appState.sessionsList = payload.sessions || [];
+      if (payload?.unchanged) {
+        await stepPromise;
+        return;
+      }
+      if (Array.isArray(payload.sessions) && payload.sessions.length > 0) {
+        appState.sessionsList = payload.sessions;
+      } else if (!isAuxPane) {
+        appState.sessionsList = payload.sessions || [];
+      }
       if (payload.empty || !payload.session) {
         appState.sessionData = null;
         appState.stepData = null;
         clearSessionCaches();
+        sessionCache.delete(targetId);
         appState.emptyReason = payload.reason || 'no_transcript_yet';
         renderTopbar();
-        renderMain();
+        if (appState.page === 'context') renderMain();
+        else paneDirty.context = true;
+        await stepPromise;
         return;
       }
       appState.emptyReason = '';
@@ -402,9 +535,16 @@
       appState.sessionQueryKey = queryKey;
       appState.sessionData = payload.session;
       appState.sessionData.fleet = payload.fleet || null;
+      if (pinnedSeq < 0) {
+        saveCurrentSessionToCache();
+      }
       renderTopbar();
-      renderMain();
-      await loadStepBrowser(appState.timeline.pinnedSeq, force);
+      if (appState.page === 'context') {
+        renderMain();
+      } else {
+        paneDirty.context = true;
+      }
+      await stepPromise;
     } catch (err) {
       if (myToken !== sessionLoadToken) return;
       showError(err);
@@ -469,8 +609,9 @@
         appState.fleet.selectedAgent = data.currentId;
       }
       renderTopbar();
-      if (!force && sameData && document.getElementById('fleet-page-host')) return;
-      renderMain();
+      if (!force && sameData && !paneDirty.fleet && document.getElementById('fleet-page-host')) return;
+      if (appState.page === 'fleet') renderMain();
+      else paneDirty.fleet = true;
     } catch (err) {
       if (myToken !== sessionLoadToken) return;
       showError(err);
@@ -480,6 +621,7 @@
   async function loadStepBrowser(seq, force = false) {
     const targetId = (appState.sessionId || '').trim();
     if (!targetId) return;
+    const myStepToken = ++stepLoadToken;
     const searchQ = (appState.browser.search || '').trim();
     const queryKey = `${targetId}|${seq}|${appState.browser.baseline}|${searchQ}`;
     const revParam = !force && !searchQ && appState.stepData && appState.stepQueryKey === queryKey
@@ -496,11 +638,14 @@
           force: force ? 1 : '',
         })}`
       );
-      if (targetId !== appState.sessionId) return;
+      if (myStepToken !== stepLoadToken || targetId !== appState.sessionId) return;
       if (data?.unchanged) return;
       appState.stepRev = data?.rev || '';
       appState.stepQueryKey = queryKey;
       appState.stepData = data?.empty ? null : data;
+      if (appState.timeline.pinnedSeq < 0 && appState.sessionData) {
+        saveCurrentSessionToCache();
+      }
       const host = document.getElementById('ctx-browser-host');
       if (host) {
         const prevInput = host.querySelector('#br-search');
@@ -517,6 +662,8 @@
             }
           }
         }
+      } else {
+        paneDirty.context = true;
       }
     } catch {
       // ignore transient hover fetch errors
@@ -524,18 +671,20 @@
   }
 
   function showError(err) {
-    const main = document.getElementById('main-content');
-    if (main) {
-      main.innerHTML = `<div class="card"><div class="empty-state" style="color:var(--danger)">${AGY.i18n.escHtml(String(err?.message || err))}</div></div>`;
+    const pane = showActivePane() || getActivePane() || document.getElementById('main-content');
+    if (pane) {
+      paneDirty[appState.page] = true;
+      pane.innerHTML = `<div class="card"><div class="empty-state" style="color:var(--danger)">${AGY.i18n.escHtml(String(err?.message || err))}</div></div>`;
     }
   }
 
   function renderMain() {
-    const main = document.getElementById('main-content');
-    if (!main) return;
+    const pane = showActivePane();
+    if (!pane) return;
 
     if (appState.page === 'insights' && !isAuxPane) {
-      AGY.views.insights.render(main, appState.insightsData, appState.insightsFilters, {
+      paneDirty.insights = false;
+      AGY.views.insights.render(pane, appState.insightsData, appState.insightsFilters, {
         onRangeChange: (nextRange) => {
           appState.insightsFilters.range = nextRange;
           appState.insightsFilters.day = '';
@@ -565,24 +714,34 @@
     }
 
     if (appState.page === 'fleet') {
+      paneDirty.fleet = false;
       if (!appState.fleet.data && appState.emptyReason) {
-        main.innerHTML = renderSessionEmptyMessage();
+        pane.innerHTML = renderSessionEmptyMessage();
         return;
       }
-      main.innerHTML = `<div id="fleet-page-host"></div>`;
+      pane.innerHTML = `<div id="fleet-page-host"></div>`;
       renderFleetPage();
       return;
     }
 
     // Context Dashboard (DSH Layout)
+    if (contextRafId) {
+      if (typeof global.cancelAnimationFrame === 'function') global.cancelAnimationFrame(contextRafId);
+      else clearTimeout(contextRafId);
+      contextRafId = 0;
+    }
+    const renderToken = ++contextRenderToken;
+
     if (!appState.sessionData) {
-      main.innerHTML = appState.emptyReason
+      paneDirty.context = false;
+      pane.innerHTML = appState.emptyReason
         ? renderSessionEmptyMessage()
         : `<div class="card"><div class="empty-state">${AGY.i18n.escHtml(AGY.i18n.t('commonLoading'))}</div></div>`;
       return;
     }
 
-    main.innerHTML = `
+    paneDirty.context = false;
+    pane.innerHTML = `
       <div id="ctx-stats-host" style="display:flex;flex-direction:column;gap:12px"></div>
       <div id="ctx-models-host"></div>
       <div class="grid-timeline-browser">
@@ -592,21 +751,35 @@
         </div>
         <div id="ctx-browser-host"></div>
       </div>
-      <div id="ctx-calls-host"></div>
-      <div id="ctx-events-host"></div>
-      <div id="ctx-files-host"></div>
-      <div id="ctx-commands-host"></div>
+      <div id="ctx-calls-host" class="ctx-below-fold"></div>
+      <div id="ctx-events-host" class="ctx-below-fold"></div>
+      <div id="ctx-files-host" class="ctx-below-fold"></div>
+      <div id="ctx-commands-host" class="ctx-below-fold"></div>
     `;
 
+    // Phase 1: synchronous above-the-fold render
     renderStatsSection(document.getElementById('ctx-stats-host'));
     renderModelsSection(document.getElementById('ctx-models-host'));
     AGY.views.stats.renderCurrentContext(document.getElementById('ctx-current-host'), appState.sessionData);
     renderTimelineSection(document.getElementById('ctx-timeline-host'));
     renderBrowserSection(document.getElementById('ctx-browser-host'));
-    renderCallsSection(document.getElementById('ctx-calls-host'));
-    renderEventsSection(document.getElementById('ctx-events-host'));
-    renderFilesSection(document.getElementById('ctx-files-host'));
-    renderCommandsSection(document.getElementById('ctx-commands-host'));
+
+    // Phase 2: next animation frame below-the-fold render
+    const schedulePhase2 = typeof global.requestAnimationFrame === 'function'
+      ? global.requestAnimationFrame.bind(global)
+      : (fn) => setTimeout(fn, 0);
+    contextRafId = schedulePhase2(() => {
+      contextRafId = 0;
+      if (renderToken !== contextRenderToken) return;
+      if (appState.page !== 'context') {
+        paneDirty.context = true;
+        return;
+      }
+      renderCallsSection(document.getElementById('ctx-calls-host'));
+      renderEventsSection(document.getElementById('ctx-events-host'));
+      renderFilesSection(document.getElementById('ctx-files-host'));
+      renderCommandsSection(document.getElementById('ctx-commands-host'));
+    });
   }
 
   function renderModelsSection(host) {
@@ -634,9 +807,12 @@
         } else if (target === 'fleet') {
           appState.page = 'fleet';
           renderTopbar();
+          const pane = showActivePane();
+          if (pane && (paneDirty.fleet || pane.childElementCount === 0)) renderMain();
           loadFleet();
         } else if (target.startsWith('file:')) {
           appState.files.kind = target.slice(5);
+          appState.files.limit = 50;
           renderFilesSection(document.getElementById('ctx-files-host'));
           document.getElementById('ctx-files-host')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
         }
@@ -649,6 +825,8 @@
         ? () => {
             appState.page = 'insights';
             renderTopbar();
+            const pane = showActivePane();
+            if (pane && (paneDirty.insights || pane.childElementCount === 0)) renderMain();
             loadActivePage();
           }
         : null,
@@ -664,7 +842,6 @@
         return;
       }
       host.innerHTML = `<div class="card"><div class="empty-state">${AGY.i18n.escHtml(AGY.i18n.t('commonLoading'))}</div></div>`;
-      loadFleet();
       return;
     }
     AGY.views.fleet.render(host, appState.fleet.data, appState.fleet, {
@@ -728,20 +905,27 @@
 
   function openContextFor(id) {
     if (!id) return;
+    saveCurrentSessionToCache();
     appState.sessionId = id;
     appState.emptyReason = '';
     appState.page = 'context';
-    appState.sessionData = null;
-    appState.stepData = null;
-    clearSessionCaches();
     appState.timeline.pinnedSeq = -1;
     appState.timeline.hoveredSeq = -1;
     appState.calls.page = 1;
     appState.browser.openItems.clear();
+    resetContextLimits();
+    if (!hydrateSessionFromCache(id)) {
+      appState.sessionData = null;
+      appState.stepData = null;
+      clearSessionCaches();
+    }
     appState.fleet.selectedAgent = id;
     appState.fleet.data = null;
     appState.fleet.signature = '';
+    paneDirty.context = true;
+    paneDirty.fleet = true;
     renderTopbar();
+    renderMain();
     loadContextSession();
   }
 
@@ -872,6 +1056,11 @@
       },
       onChangeType: (t) => {
         appState.events.type = t;
+        appState.events.limit = 50;
+        renderEventsSection(host);
+      },
+      onLoadMore: () => {
+        appState.events.limit = (Number(appState.events.limit) || 50) + 50;
         renderEventsSection(host);
       },
       onJumpSeq: (seq) => {
@@ -891,16 +1080,22 @@
       },
       onChangeKind: (k) => {
         appState.files.kind = k;
+        appState.files.limit = 50;
         renderFilesSection(host);
       },
       onSearch: (q) => {
         appState.files.search = q;
+        appState.files.limit = 50;
         renderFilesSection(host);
         const inp = host.querySelector('#fa-search');
         if (inp) { inp.focus(); inp.setSelectionRange(q.length, q.length); }
       },
       onSort: (s) => {
         appState.files.sortBy = s;
+        renderFilesSection(host);
+      },
+      onLoadMore: () => {
+        appState.files.limit = (Number(appState.files.limit) || 50) + 50;
         renderFilesSection(host);
       },
       onToggleFile: (fp, opts) => {
@@ -934,10 +1129,12 @@
       },
       onChangeStatus: (s) => {
         appState.commands.status = s;
+        appState.commands.limit = 50;
         renderCommandsSection(host);
       },
       onSearch: (q) => {
         appState.commands.search = q;
+        appState.commands.limit = 50;
         if (q !== appState.commands.program) appState.commands.program = '';
         renderCommandsSection(host);
         const inp = host.querySelector('#cmd-search');
@@ -946,6 +1143,11 @@
       onSelectProgram: (prog, queryStr) => {
         appState.commands.program = prog;
         appState.commands.search = queryStr;
+        appState.commands.limit = 50;
+        renderCommandsSection(host);
+      },
+      onLoadMore: () => {
+        appState.commands.limit = (Number(appState.commands.limit) || 50) + 50;
         renderCommandsSection(host);
       },
       onJumpToBrowserStep: async (seq, stepIdx) => {
@@ -985,13 +1187,18 @@
         }
       });
     }
-    try {
-      appState.prefs = await AGY.bridge.apiFetch('/api/prefs');
-    } catch {
-      // use defaults
+    if (global.__AGY_INIT_PREFS__ && typeof global.__AGY_INIT_PREFS__ === 'object') {
+      appState.prefs = Object.assign({}, appState.prefs, global.__AGY_INIT_PREFS__);
+    } else {
+      try {
+        appState.prefs = await AGY.bridge.apiFetch('/api/prefs');
+      } catch {
+        // use defaults
+      }
     }
     applyPrefsToState();
     renderTopbar();
+    renderMain();
     await loadActivePage();
 
     document.addEventListener('visibilitychange', () => {

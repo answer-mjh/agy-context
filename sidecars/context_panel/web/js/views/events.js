@@ -13,7 +13,9 @@
     const { t, fmtSignedTokens, fmtClock, escHtml } = AGY.i18n;
     const all = events || [];
     const activeType = state.type || 'all';
+    const limit = Math.max(50, Number(state?.limit) || 50);
     let isCollapsed = Boolean(state?.collapsed);
+    let bodyBuilt = !isCollapsed;
 
     const counts = { all: all.length, injection: 0, compaction: 0, skill: 0, model_switch: 0, error: 0 };
     for (const ev of all) {
@@ -21,6 +23,8 @@
     }
 
     const filtered = activeType === 'all' ? all : all.filter(ev => ev.type === activeType);
+    const visible = filtered.slice(0, limit);
+    const remaining = Math.max(0, filtered.length - visible.length);
 
     const tabs = [
       { key: 'all', label: t('evAll') },
@@ -30,6 +34,57 @@
       { key: 'model_switch', label: t('evModel') },
       { key: 'error', label: t('evError') },
     ];
+
+    const buildBodyHtml = () => {
+      if (filtered.length === 0) {
+        return `<div class="empty-state">${escHtml(t('noEvents'))}</div>`;
+      }
+      return `
+        <div class="list-scroll">
+          ${visible.map(ev => {
+            const em = EV_META[ev.type] || { i18n: 'evInjection', cls: '' };
+            const deltaCls = ev.tokenDelta < 0 ? 'delta-neg' : ev.tokenDelta > 0 ? 'delta-pos' : 'delta-zero';
+            return `
+              <div class="row-item" style="cursor:pointer" data-ev-seq="${ev.plannerSeq}">
+                <div class="row-head">
+                  <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+                    <span class="pill ${em.cls}">${escHtml(t(em.i18n))}</span>
+                    <span style="font-weight:600;font-size:12px">${escHtml(ev.label)}</span>
+                    <span class="pill mono" style="font-size:10px">${escHtml(ev.source)}</span>
+                  </div>
+                  <div style="display:flex;align-items:center;gap:8px">
+                    ${ev.tokenDelta ? `<span class="${deltaCls} mono">${escHtml(fmtSignedTokens(ev.tokenDelta))} tok</span>` : ''}
+                    <span class="pill mono" style="font-size:10px">T${ev.turnIndex} · S${ev.stepIndex}</span>
+                    <span class="card-subtitle mono">${escHtml(fmtClock(ev.createdAt))}</span>
+                  </div>
+                </div>
+                ${ev.detail ? `<div class="card-subtitle mono" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(ev.detail)}</div>` : ''}
+              </div>
+            `;
+          }).join('')}
+        </div>
+        ${remaining > 0 ? `
+          <div class="list-more-wrap">
+            <button class="btn btn-sm" type="button" data-load-more>${escHtml(t('showMoreItems').replace('{count}', String(remaining)))}</button>
+          </div>
+        ` : ''}
+      `;
+    };
+
+    const bindBody = (bodyEl) => {
+      if (!bodyEl) return;
+      bodyEl.addEventListener('click', (e) => {
+        const moreBtn = e.target?.closest?.('[data-load-more]');
+        if (moreBtn) {
+          callbacks?.onLoadMore?.();
+          return;
+        }
+        const row = e.target?.closest?.('[data-ev-seq]');
+        if (row) {
+          callbacks?.onJumpSeq?.(Number(row.getAttribute('data-ev-seq')));
+        }
+      });
+    };
 
     container.innerHTML = `
       <div class="card">
@@ -53,32 +108,7 @@
           </div>
         </div>
         <div class="ev-body"${isCollapsed ? ' hidden' : ''}>
-          ${filtered.length === 0
-            ? `<div class="empty-state">${escHtml(t('noEvents'))}</div>`
-            : `<div class="list-scroll">
-                ${filtered.map(ev => {
-                  const em = EV_META[ev.type] || { i18n: 'evInjection', cls: '' };
-                  const deltaCls = ev.tokenDelta < 0 ? 'delta-neg' : ev.tokenDelta > 0 ? 'delta-pos' : 'delta-zero';
-                  return `
-                    <div class="row-item" style="cursor:pointer" data-ev-seq="${ev.plannerSeq}">
-                      <div class="row-head">
-                        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
-                          <span class="pill ${em.cls}">${escHtml(t(em.i18n))}</span>
-                          <span style="font-weight:600;font-size:12px">${escHtml(ev.label)}</span>
-                          <span class="pill mono" style="font-size:10px">${escHtml(ev.source)}</span>
-                        </div>
-                        <div style="display:flex;align-items:center;gap:8px">
-                          ${ev.tokenDelta ? `<span class="${deltaCls} mono">${escHtml(fmtSignedTokens(ev.tokenDelta))} tok</span>` : ''}
-                          <span class="pill mono" style="font-size:10px">T${ev.turnIndex} · S${ev.stepIndex}</span>
-                          <span class="card-subtitle mono">${escHtml(fmtClock(ev.createdAt))}</span>
-                        </div>
-                      </div>
-                      ${ev.detail ? `<div class="card-subtitle mono" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(ev.detail)}</div>` : ''}
-                    </div>
-                  `;
-                }).join('')}
-              </div>`
-          }
+          ${bodyBuilt ? buildBodyHtml() : ''}
         </div>
       </div>
     `;
@@ -90,6 +120,11 @@
       const chevEl = container.querySelector('#ev-toggle .calls-chevron');
       const foldBtn = container.querySelector('#ev-toggle');
       const actionBtn = container.querySelector('#ev-fold-action');
+      if (!isCollapsed && !bodyBuilt && bodyEl) {
+        bodyBuilt = true;
+        bodyEl.innerHTML = buildBodyHtml();
+        bindBody(bodyEl);
+      }
       if (bodyEl) bodyEl.hidden = isCollapsed;
       if (filtersEl) filtersEl.hidden = isCollapsed;
       if (chevEl) chevEl.textContent = isCollapsed ? '▸' : '▾';
@@ -103,9 +138,10 @@
     container.querySelectorAll('[data-evtype]').forEach(btn => {
       btn.addEventListener('click', () => callbacks?.onChangeType?.(btn.getAttribute('data-evtype')));
     });
-    container.querySelectorAll('[data-ev-seq]').forEach(row => {
-      row.addEventListener('click', () => callbacks?.onJumpSeq?.(Number(row.getAttribute('data-ev-seq'))));
-    });
+
+    if (bodyBuilt) {
+      bindBody(container.querySelector('.ev-body'));
+    }
   }
 
   AGY.views = AGY.views || {};
